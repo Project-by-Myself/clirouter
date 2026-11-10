@@ -4,6 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Project-by-Myself/clirouter/internal/redact"
 )
 
 type Account struct {
@@ -24,12 +26,12 @@ func (a *Account) End()   { a.inflight.Add(-1) }
 type FailureKind uint8
 
 const (
-	FailRateLimit     FailureKind = iota // 429: scoped to the model unless the quota is account-wide
-	FailQuota                            // quota/billing exhausted for the whole account
-	FailAuth                             // 401/403 that a refresh could not fix
-	FailModel                            // model not found / not enabled on this account
-	FailServer                           // 5xx / overloaded
-	FailNetwork                          // dial, TLS, first-byte timeout, reset
+	FailRateLimit FailureKind = iota // 429: scoped to the model unless the quota is account-wide
+	FailQuota                        // quota/billing exhausted for the whole account
+	FailAuth                         // 401/403 that a refresh could not fix
+	FailModel                        // model not found / not enabled on this account
+	FailServer                       // 5xx / overloaded
+	FailNetwork                      // dial, TLS, first-byte timeout, reset
 )
 
 type state struct {
@@ -77,7 +79,7 @@ func (a *Account) MarkFailure(model string, kind FailureKind, retryAfter time.Du
 	defer s.mu.Unlock()
 	s.fails++
 	s.failures++
-	s.lastErr = msg
+	s.lastErr = redact.String(msg)
 	s.lastErrAt = now
 	s.lastUsed = now
 	var d time.Duration

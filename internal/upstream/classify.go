@@ -9,6 +9,7 @@ import (
 
 	"github.com/tidwall/gjson"
 
+	"github.com/Project-by-Myself/clirouter/internal/redact"
 	"github.com/Project-by-Myself/clirouter/internal/router"
 )
 
@@ -83,7 +84,9 @@ func containsAny(s string, subs ...string) bool {
 }
 
 // ErrorMessage extracts a human message from the common error shapes.
-func ErrorMessage(body []byte) string {
+func ErrorMessage(body []byte) string { return redact.String(errorMessage(body)) }
+
+func errorMessage(body []byte) string {
 	body = bytes.TrimSpace(body)
 	if len(body) == 0 {
 		return ""

@@ -118,10 +118,10 @@ func New(cfg *config.Config, prev *Router, oauth func(providerID, accountID stri
 }
 
 func mask(k string) string {
-	if len(k) <= 10 {
+	if len(k) < 16 {
 		return "****"
 	}
-	return k[:6] + "…" + k[len(k)-4:]
+	return "…" + k[len(k)-4:]
 }
 
 func (r *Router) Providers() []*Provider { return r.ordered }

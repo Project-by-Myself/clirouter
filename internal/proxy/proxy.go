@@ -20,6 +20,7 @@ import (
 
 	"github.com/Project-by-Myself/clirouter/internal/config"
 	"github.com/Project-by-Myself/clirouter/internal/ir"
+	"github.com/Project-by-Myself/clirouter/internal/redact"
 	"github.com/Project-by-Myself/clirouter/internal/router"
 	"github.com/Project-by-Myself/clirouter/internal/sse"
 	"github.com/Project-by-Myself/clirouter/internal/store"
@@ -292,7 +293,7 @@ func (c *call) attempt(ctx context.Context, t router.Target, a *router.Account) 
 			out := &failure{Failure: f}
 			if f.Action == upstream.Fatal {
 				if pass {
-					out.raw = raw
+					out.raw = redact.Bytes(raw)
 				}
 			} else {
 				a.MarkFailure(t.Model, f.Kind, f.RetryAfter, f.Message)
@@ -539,7 +540,7 @@ func (c *call) finish() {
 		if c.rec.Status < 400 {
 			c.rec.Status = 502
 		}
-		c.rec.Error = c.errMsg
+		c.rec.Error = redact.String(c.errMsg)
 	}
 	if c.rec.Status == 0 {
 		c.rec.Status = 499
