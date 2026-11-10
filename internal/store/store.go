@@ -67,7 +67,13 @@ func Open(dir string, retainDays int) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	dsn := "file:" + filepath.Join(dir, "clirouter.db") + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)"
+	// Create the database 0600 up front: SQLite gives its -wal/-shm files the
+	// same mode as the main file, and the umask default is world-readable.
+	dbPath := filepath.Join(dir, "clirouter.db")
+	if f, err := os.OpenFile(dbPath, os.O_RDWR|os.O_CREATE, 0o600); err == nil {
+		f.Close()
+	}
+	dsn := "file:" + dbPath + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -113,7 +119,11 @@ func (s *Store) run() {
 	batch := make([]Record, 0, 256)
 	flush := func() {
 		if len(batch) > 0 {
-			_ = s.insert(batch)
+			// A failed write (disk full, locked DB) drops the batch and is
+			// counted; the hot path never waits on SQLite.
+			if err := s.insert(batch); err != nil {
+				s.dropped.Add(int64(len(batch)))
+			}
 			batch = batch[:0]
 		}
 	}
