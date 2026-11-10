@@ -48,6 +48,29 @@ func Classify(status int, h http.Header, body []byte, oauth bool) Failure {
 		f.Message = http.StatusText(status)
 	}
 	lower := strings.ToLower(f.Message)
+	if aws := awsErrorType(h); aws != "" {
+		// AWS names the error in X-Amzn-ErrorType ("ThrottlingException:…");
+		// some of them use a status that would be misread (a quota error is 400).
+		switch {
+		case strings.HasPrefix(aws, "throttling"), strings.HasPrefix(aws, "servicequotaexceeded"):
+			f.Kind, f.Action, f.Type = router.FailRateLimit, NextAccount, "rate_limit_error"
+			return f
+		case strings.HasPrefix(aws, "accessdenied"), strings.HasPrefix(aws, "unrecognizedclient"),
+			strings.HasPrefix(aws, "expiredtoken"), strings.HasPrefix(aws, "invalidsignature"),
+			strings.HasPrefix(aws, "incompletesignature"):
+			f.Kind, f.Action, f.Type = router.FailAuth, NextAccount, "authentication_error"
+			return f
+		case strings.HasPrefix(aws, "resourcenotfound"):
+			f.Kind, f.Action, f.Type = router.FailModel, NextTarget, "not_found_error"
+			return f
+		case strings.HasPrefix(aws, "modelnotready"), strings.HasPrefix(aws, "modelerror"), strings.HasPrefix(aws, "modeltimeout"):
+			f.Kind, f.Action, f.Type = router.FailServer, NextAccount, "api_error"
+			return f
+		case strings.HasPrefix(aws, "serviceunavailable"):
+			f.Kind, f.Action, f.Type = router.FailServer, NextTarget, "overloaded_error"
+			return f
+		}
+	}
 	switch {
 	case status == 401 || status == 403:
 		f.Kind, f.Action, f.Type = router.FailAuth, NextAccount, "authentication_error"
@@ -66,7 +89,8 @@ func Classify(status int, h http.Header, body []byte, oauth bool) Failure {
 		f.Kind, f.Action, f.Type = router.FailModel, NextTarget, "not_found_error"
 	case status == 400 || status == 422:
 		f.Action, f.Type = Fatal, "invalid_request_error"
-		if containsAny(lower, "model not found", "does not exist", "unsupported model", "not supported model", "model_not_found", "invalid model", "no such model", "not available for") {
+		if containsAny(lower, "model not found", "does not exist", "unsupported model", "not supported model", "model_not_found", "invalid model", "no such model", "not available for",
+			"model identifier is invalid", "deploymentnotfound", "deployment for this resource does not exist") {
 			f.Kind, f.Action = router.FailModel, NextTarget
 		}
 	case status == 413:
@@ -81,6 +105,17 @@ func Classify(status int, h http.Header, body []byte, oauth bool) Failure {
 		f.Action, f.Type = Fatal, "invalid_request_error"
 	}
 	return f
+}
+
+// awsErrorType returns the lower-cased AWS error code from X-Amzn-ErrorType
+// ("ValidationException:http://…" -> "validationexception"), or "".
+func awsErrorType(h http.Header) string {
+	v := h.Get("X-Amzn-Errortype")
+	if v == "" {
+		return ""
+	}
+	v, _, _ = strings.Cut(v, ":")
+	return strings.ToLower(v)
 }
 
 func containsAny(s string, subs ...string) bool {
@@ -103,7 +138,7 @@ func errorMessage(body []byte) string {
 	if body[0] == '[' { // Gemini sometimes wraps errors in an array
 		body = []byte(gjson.GetBytes(body, "0").Raw)
 	}
-	for _, p := range []string{"error.message", "message", "error.msg", "detail", "error"} {
+	for _, p := range []string{"error.message", "message", "Message", "error.msg", "detail", "error"} {
 		if v := gjson.GetBytes(body, p); v.Exists() && v.Type == gjson.String && v.Str != "" {
 			return v.Str
 		}

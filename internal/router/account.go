@@ -167,6 +167,9 @@ func (a *Account) Status() AccountStatus {
 	st := AccountStatus{ID: a.ID, Provider: a.Provider.Cfg.ID, Label: a.Label, Kind: "api_key", Inflight: a.inflight.Load()}
 	if a.OAuth != nil {
 		st.Kind = "oauth"
+		if k, ok := a.OAuth.(interface{ Kind() string }); ok {
+			st.Kind = k.Kind() // e.g. "service_account"
+		}
 		st.Meta = a.OAuth.Meta()
 	}
 	s.mu.Lock()

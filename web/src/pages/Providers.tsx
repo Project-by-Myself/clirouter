@@ -6,7 +6,7 @@ import { ChipsInput, fromRows, KVEditor, rowsError, toRows, type KVRows } from "
 import { useT, type TFn } from "../i18n";
 import { Icon } from "../icons";
 import { useConfig } from "../store";
-import { BUDGET_PERIODS, OAUTH_TYPE_MAP, OAUTH_TYPES, PROVIDER_TYPES, type BudgetPeriod, type Config, type Provider, type ProviderUsage } from "../types";
+import { BUDGET_PERIODS, bedrockRegion, HINT_TYPES, KEYLESS_TYPES, OAUTH_TYPE_MAP, OAUTH_TYPES, PROVIDER_TYPES, REGION_TYPES, type BudgetPeriod, type Config, type Provider, type ProviderUsage } from "../types";
 import { OAUTH_LABEL, OAuthFlow } from "../oauth";
 import { Badge, Drawer, Empty, ErrorNote, Field, Meter, Switch, useConfirm, useToast } from "../ui";
 import { clone, fmtDuration, fmtUsd, isMasked, maskHint, parseDuration } from "../util";
@@ -29,6 +29,8 @@ interface Form {
   idle: string;
   budget_usd: string;
   budget_period: BudgetPeriod;
+  region: string;
+  project: string;
 }
 
 function toForm(p: Provider | null): Form {
@@ -50,6 +52,8 @@ function toForm(p: Provider | null): Form {
     idle: p ? fmtDuration(p.idle) : "",
     budget_usd: p?.budget_usd ? String(p.budget_usd) : "",
     budget_period: p?.budget_period || "monthly",
+    region: p?.region || "",
+    project: p?.project || "",
   };
 }
 
@@ -66,7 +70,12 @@ function mergeKeys(keys: string[], extra: string): string[] {
   return out;
 }
 
-type Errors = Partial<Record<"id" | "type" | "base_url" | "first_byte" | "idle" | "priority" | "model_map" | "headers" | "keys" | "budget_usd", string>>;
+type Errors = Partial<Record<"id" | "type" | "base_url" | "first_byte" | "idle" | "priority" | "model_map" | "headers" | "keys" | "budget_usd" | "region", string>>;
+
+/** Key strings that are references, not secrets, and can be shown in full. */
+function isKeyRef(k: string): boolean {
+  return k.startsWith("env:") || k.startsWith("sa:") || k === "aws:env";
+}
 
 function validate(f: Form, cfg: Config, t: TFn): Errors {
   const e: Errors = {};
@@ -78,6 +87,8 @@ function validate(f: Form, cfg: Config, t: TFn): Errors {
   if (!(f.type in PROVIDER_TYPES)) e.type = t("val.required");
   if (!f.base_url.trim() && !PROVIDER_TYPES[f.type]) e.base_url = t("val.baseUrlRequired");
   else if (f.base_url.trim() && !/^https?:\/\//.test(f.base_url.trim())) e.base_url = t("val.url");
+  else if (f.type === "bedrock" && !f.region.trim() && !bedrockRegion(f.base_url)) e.base_url = t("val.bedrockRegion");
+  if (REGION_TYPES.has(f.type) && f.region.trim() && !/^[a-z0-9][a-z0-9-]*$/.test(f.region.trim())) e.region = t("val.region");
   if (parseDuration(f.first_byte) === null) e.first_byte = t("val.duration");
   if (parseDuration(f.idle) === null) e.idle = t("val.duration");
   if (f.priority.trim() && !/^-?\d+$/.test(f.priority.trim())) e.priority = t("val.int");
@@ -107,6 +118,8 @@ function fromForm(f: Form, base: Provider | null): Provider {
     idle: parseDuration(f.idle) || 0,
     budget_usd: f.budget_usd.trim() ? Number(f.budget_usd) : 0,
     budget_period: f.budget_period,
+    region: REGION_TYPES.has(f.type) ? f.region.trim() || undefined : undefined,
+    project: f.type === "vertex" ? f.project.trim() || undefined : undefined,
   };
 }
 
@@ -194,6 +207,16 @@ const TYPE_COLOR: Record<string, string> = {
   "gemini-cli": "#1a5fd0",
   vertex: "#188038",
   copilot: "#6e40c9",
+  "azure-openai": "#0a6ac2",
+  bedrock: "#b45309",
+  ollama: "#3f3f46",
+};
+
+const KEY_PLACEHOLDER: Record<string, string> = {
+  bedrock: "env:AWS_BEARER_TOKEN_BEDROCK\naws:env\naws:AKIA…:secret",
+  vertex: "sa:/path/to/service-account.json\nsa:env:GOOGLE_SA_JSON\nenv:VERTEX_API_KEY",
+  "azure-openai": "env:AZURE_OPENAI_API_KEY",
+  ollama: "(optional)",
 };
 
 function ProviderAvatar({ p }: { p: Provider }) {
@@ -238,11 +261,14 @@ function ProviderCard({ p, usage, onEdit, onToggle, onDelete }: { p: Provider; u
         <dd>
           {p.keys.length} {p.keys.length === 1 ? t("prov.keyLc") : t("prov.keysLc")}
           {p.oauth.length > 0 && ` · ${p.oauth.length} OAuth`}
-          {p.keys.length + p.oauth.length === 0 && (
-            <Badge tone="warn" icon="alert">
-              {t("prov.noCreds")}
-            </Badge>
-          )}
+          {p.keys.length + p.oauth.length === 0 &&
+            (KEYLESS_TYPES.has(p.type) ? (
+              <span className="faint small">{t("prov.keyless")}</span>
+            ) : (
+              <Badge tone="warn" icon="alert">
+                {t("prov.noCreds")}
+              </Badge>
+            ))}
         </dd>
         {p.priority !== 0 && (
           <>
@@ -257,6 +283,18 @@ function ProviderCard({ p, usage, onEdit, onToggle, onDelete }: { p: Provider; u
               {p.first_byte > 0 && `first_byte ${fmtDuration(p.first_byte)} `}
               {p.idle > 0 && `idle ${fmtDuration(p.idle)}`}
             </dd>
+          </>
+        )}
+        {p.region && (
+          <>
+            <dt>{t("prov.region")}</dt>
+            <dd className="mono ellipsis">{p.region}</dd>
+          </>
+        )}
+        {p.project && (
+          <>
+            <dt>{t("prov.project")}</dt>
+            <dd className="mono ellipsis">{p.project}</dd>
           </>
         )}
         {p.proxy && (
@@ -315,6 +353,7 @@ function ProviderDrawer({ form, setForm, config, save, onClose }: { form: Form; 
   const isOAuth = OAUTH_TYPES.has(form.type);
   const pending = splitKeys(form.newKeys).length;
   const oauthType = OAUTH_TYPE_MAP[form.type];
+  const typeHint = HINT_TYPES.has(form.type);
   const [login, setLogin] = useState(false);
   const toast = useToast();
 
@@ -390,20 +429,44 @@ function ProviderDrawer({ form, setForm, config, save, onClose }: { form: Form; 
             )}
           </Field>
         </div>
-        <Field label={t("prov.baseUrl")} hint={defURL ? t("prov.baseUrlHint", { url: defURL }) : t("prov.baseUrlReq")} error={show("base_url")}>
+        <Field label={t("prov.baseUrl")} hint={typeHint ? t(`prov.urlHint.${form.type}` as Key) : defURL ? t("prov.baseUrlHint", { url: defURL }) : t("prov.baseUrlReq")} error={show("base_url")}>
           {(id, d) => <input id={id} aria-describedby={d} aria-invalid={!!show("base_url")} className="input mono" value={form.base_url} placeholder={defURL || "https://…/v1"} onChange={(e) => set("base_url", e.target.value)} />}
         </Field>
+
+        {REGION_TYPES.has(form.type) && (
+          <div className="grid-2">
+            <Field label={t("prov.region")} hint={t(`prov.regionHint.${form.type}` as Key)} error={show("region")}>
+              {(id, d) => (
+                <input
+                  id={id}
+                  aria-describedby={d}
+                  aria-invalid={!!show("region")}
+                  className="input mono"
+                  value={form.region}
+                  placeholder={form.type === "bedrock" ? bedrockRegion(form.base_url) || "us-east-1" : "global"}
+                  onChange={(e) => set("region", e.target.value)}
+                />
+              )}
+            </Field>
+            {form.type === "vertex" && (
+              <Field label={t("prov.project")} hint={t("prov.projectHint")}>
+                {(id, d) => <input id={id} aria-describedby={d} className="input mono" value={form.project} placeholder="my-gcp-project" onChange={(e) => set("project", e.target.value)} />}
+              </Field>
+            )}
+          </div>
+        )}
 
         <div className="section-title">{t("prov.creds")}</div>
         {errs.keys && <ErrorNote error={errs.keys} />}
         <div className="field">
           <span className="field-label">{t("prov.keys")}</span>
-          {form.keys.length === 0 && <div className="faint small">{t("prov.noKeys")}</div>}
+          {typeHint && <span className="hint">{t(`prov.keyHint.${form.type}` as Key)}</span>}
+          {form.keys.length === 0 && <div className="faint small">{KEYLESS_TYPES.has(form.type) ? t("prov.keyless") : t("prov.noKeys")}</div>}
           {form.keys.map((k, i) => (
             <div className="list-row" key={`${k}-${i}`}>
               <Icon name="key" size={13} className="faint" />
-              <span className="mono grow ellipsis">{isMasked(k) ? maskHint(k) : k.startsWith("env:") ? k : `${k.slice(0, 6)}…${k.slice(-4)}`}</span>
-              {isMasked(k) ? <Badge icon="lock">{t("prov.saved")}</Badge> : k.startsWith("env:") ? <Badge tone="accent">env</Badge> : <Badge tone="warn">{t("prov.new")}</Badge>}
+              <span className="mono grow ellipsis">{isMasked(k) ? maskHint(k) : isKeyRef(k) ? k : `${k.slice(0, 6)}…${k.slice(-4)}`}</span>
+              {isMasked(k) ? <Badge icon="lock">{t("prov.saved")}</Badge> : isKeyRef(k) ? <Badge tone="accent">{k.split(":")[0]}</Badge> : <Badge tone="warn">{t("prov.new")}</Badge>}
               <button type="button" className="btn ghost icon sm" aria-label={t("common.removeX", { x: `key ${i + 1}` })} onClick={() => set("keys", form.keys.filter((_, j) => j !== i))}>
                 <Icon name="trash" size={13} />
               </button>
@@ -413,7 +476,7 @@ function ProviderDrawer({ form, setForm, config, save, onClose }: { form: Form; 
         <Field label={t("prov.pasteKeys")} hint={t("prov.pasteHint")}>
           {(id, d) => (
             <div className="col">
-              <textarea id={id} aria-describedby={d} className="input" rows={3} value={form.newKeys} onChange={(e) => set("newKeys", e.target.value)} placeholder={"sk-...\nsk-...\nenv:MY_KEY"} spellCheck={false} autoComplete="off" />
+              <textarea id={id} aria-describedby={d} className="input" rows={3} value={form.newKeys} onChange={(e) => set("newKeys", e.target.value)} placeholder={KEY_PLACEHOLDER[form.type] || "sk-...\nsk-...\nenv:MY_KEY"} spellCheck={false} autoComplete="off" />
               <div>
                 <button type="button" className="btn sm" disabled={!pending} onClick={() => setForm({ ...form, keys: mergeKeys(form.keys, form.newKeys), newKeys: "" })}>
                   <Icon name="plus" size={13} /> {t("prov.addKeys", { n: pending })}

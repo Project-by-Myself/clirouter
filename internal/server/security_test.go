@@ -166,6 +166,22 @@ func TestMaskShowsOnlyLastChars(t *testing.T) {
 	}
 }
 
+// Service-account paths and "aws:env" are references, shown as-is; inline
+// IAM credentials are secrets and stay masked.
+func TestMaskCloudKeyReferences(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{
+		{ID: "vx", Type: "vertex", Keys: []string{"sa:/etc/clirouter/sa.json", "sa:env:GOOGLE_SA"}},
+		{ID: "br", Type: "bedrock", Keys: []string{"aws:env", "aws:AKIDEXAMPLE:supersecretvalue1234"}},
+	}}
+	m := masked(cfg)
+	if m.Providers[0].Keys[0] != "sa:/etc/clirouter/sa.json" || m.Providers[0].Keys[1] != "sa:env:GOOGLE_SA" || m.Providers[1].Keys[0] != "aws:env" {
+		t.Fatalf("references masked: %v %v", m.Providers[0].Keys, m.Providers[1].Keys)
+	}
+	if k := m.Providers[1].Keys[1]; !strings.HasPrefix(k, keepSecret) || strings.Contains(k, "AKID") {
+		t.Fatalf("aws credentials not masked: %q", k)
+	}
+}
+
 func TestExposedKeepsAdminPassword(t *testing.T) {
 	s, hs := newTestServer(t)
 	s.Exposed = true

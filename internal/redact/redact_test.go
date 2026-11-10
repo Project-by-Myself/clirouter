@@ -13,6 +13,9 @@ func TestString(t *testing.T) {
 		"ya29.a0AfH6SMBxxxxxxxxxxxxxxxx",
 		"ghu_abcdefghijklmnopqrstuvwxyz0123",
 		"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig",
+		"AKIAIOSFODNN7EXAMPLE",
+		"ABSKQmVkcm9ja0FQSUtleS1leGFtcGxlLWtleQ==",
+		"-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n-----END PRIVATE KEY-----",
 	}
 	for _, sec := range secrets {
 		in := `{"error":{"message":"Incorrect API key provided: ` + sec + `. See docs."}}`

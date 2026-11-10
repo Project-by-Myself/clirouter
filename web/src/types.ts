@@ -83,6 +83,8 @@ export interface Provider {
   idle: number;
   budget_usd?: number;
   budget_period?: BudgetPeriod;
+  region?: string; // bedrock: AWS region; vertex: Google Cloud location
+  project?: string; // vertex: Google Cloud project override
 }
 
 export interface Combo {
@@ -192,7 +194,23 @@ export const PROVIDER_TYPES: Record<string, string> = {
   "claude-oauth": "https://api.anthropic.com",
   copilot: "https://api.githubcopilot.com",
   "gemini-cli": "https://cloudcode-pa.googleapis.com",
+  "azure-openai": "",
+  ollama: "http://127.0.0.1:11434/v1",
+  bedrock: "",
 };
+
+/** Types that work without any key (one keyless account). */
+export const KEYLESS_TYPES = new Set(["ollama"]);
+/** Types with a region/location field. */
+export const REGION_TYPES = new Set(["bedrock", "vertex"]);
+/** Types with a per-type base URL / key hint in the dictionary. */
+export const HINT_TYPES = new Set(["azure-openai", "bedrock", "ollama", "vertex"]);
+
+/** Bedrock region from a bedrock-runtime[-fips].<region>.amazonaws.com URL. */
+export function bedrockRegion(baseUrl: string): string {
+  const m = /^https?:\/\/bedrock-runtime(?:-fips)?\.([a-z0-9-]+)\.amazonaws\.com/i.exec(baseUrl.trim());
+  return m ? m[1].toLowerCase() : "";
+}
 
 export const OAUTH_TYPES = new Set(["codex", "claude-oauth", "copilot", "gemini-cli"]);
 

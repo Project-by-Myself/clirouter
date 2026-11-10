@@ -141,7 +141,7 @@ export default function Accounts() {
                               {a.label || a.id}
                             </div>
                             <div className="faint small row" style={{ gap: 6 }}>
-                              <span>{a.kind === "oauth" ? "OAuth" : "API key"}</span>
+                              <span>{a.kind === "oauth" ? "OAuth" : a.kind === "service_account" ? "Service account" : "API key"}</span>
                               {a.meta &&
                                 Object.entries(a.meta)
                                   .slice(0, 2)

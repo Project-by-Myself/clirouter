@@ -130,7 +130,8 @@ func masked(cfg *config.Config) *config.Config {
 	var c config.Config
 	json.Unmarshal(b, &c)
 	hide := func(i int, owner, v string) string {
-		if strings.HasPrefix(v, "env:") {
+		// References (env vars, service-account file paths) are not secrets.
+		if strings.HasPrefix(v, "env:") || (owner != "" && (strings.HasPrefix(v, config.ServiceAccountPrefix) || v == config.AWSKeyPrefix+"env")) {
 			return v
 		}
 		hint := "****"

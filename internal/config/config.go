@@ -170,6 +170,14 @@ type Provider struct {
 	// this provider and falls back to the next target. 0 = unlimited.
 	BudgetUSD    float64 `yaml:"budget_usd,omitempty" json:"budget_usd,omitempty"`
 	BudgetPeriod string  `yaml:"budget_period,omitempty" json:"budget_period,omitempty"`
+	// Region is the AWS region for bedrock (default: parsed from the
+	// base_url host) or the Google Cloud location for vertex (default:
+	// parsed from a "<location>-aiplatform.googleapis.com" host, else
+	// "global").
+	Region string `yaml:"region,omitempty" json:"region,omitempty"`
+	// Project overrides the Google Cloud project of a vertex service
+	// account (default: the project_id in its JSON key).
+	Project string `yaml:"project,omitempty" json:"project,omitempty"`
 }
 
 type Combo struct {
@@ -189,6 +197,63 @@ var DefaultBaseURL = map[string]string{
 	"claude-oauth":      "https://api.anthropic.com",
 	"copilot":           "https://api.githubcopilot.com",
 	"gemini-cli":        "https://cloudcode-pa.googleapis.com",
+	"azure-openai":      "",
+	"ollama":            "http://127.0.0.1:11434/v1",
+	"bedrock":           "",
+}
+
+// KeyOptional reports provider types that work without any credential
+// (local servers); such a provider gets one keyless account.
+func KeyOptional(providerType string) bool { return providerType == "ollama" }
+
+// Key prefixes for cloud credentials that are not plain API keys.
+const (
+	// AWSKeyPrefix marks IAM credentials for bedrock, signed with SigV4:
+	// "aws:<ACCESS_KEY_ID>:<SECRET_ACCESS_KEY>[:<SESSION_TOKEN>]", or
+	// "aws:env" for AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+	// AWS_SESSION_TOKEN from the environment.
+	AWSKeyPrefix = "aws:"
+	// ServiceAccountPrefix marks a Google service-account JSON key for
+	// vertex: "sa:<path>" or "sa:env:<VAR>" (the variable holds the JSON).
+	ServiceAccountPrefix = "sa:"
+)
+
+// BedrockRegion returns the AWS region of a bedrock provider: Region, or
+// the region in a "bedrock-runtime[-fips].<region>.amazonaws.com" host.
+func (p *Provider) BedrockRegion() string {
+	if p.Region != "" {
+		return p.Region
+	}
+	host := hostOf(p.BaseURL)
+	for _, pre := range []string{"bedrock-runtime.", "bedrock-runtime-fips."} {
+		if rest, ok := strings.CutPrefix(host, pre); ok {
+			if region, _, ok := strings.Cut(rest, "."); ok && region != "" {
+				return region
+			}
+		}
+	}
+	return ""
+}
+
+// VertexLocation returns the Google Cloud location of a vertex provider:
+// Region, or the location in a "<location>-aiplatform.googleapis.com" host,
+// else "global".
+func (p *Provider) VertexLocation() string {
+	if p.Region != "" {
+		return p.Region
+	}
+	if loc, ok := strings.CutSuffix(hostOf(p.BaseURL), "-aiplatform.googleapis.com"); ok && loc != "" {
+		return loc
+	}
+	return "global"
+}
+
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
 }
 
 func Default() *Config {
@@ -278,6 +343,12 @@ func (c *Config) Validate() error {
 		if p.BaseURL == "" {
 			errs = append(errs, fmt.Errorf("provider %q: base_url is required for type %s", p.ID, p.Type))
 		}
+		if p.BaseURL != "" {
+			if u, err := url.Parse(p.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				errs = append(errs, fmt.Errorf("provider %q: base_url %q: want http(s)://host[/path]", p.ID, p.BaseURL))
+			}
+		}
+		errs = append(errs, p.validateCloud()...)
 		if p.FirstByte < 0 || p.Idle < 0 {
 			errs = append(errs, fmt.Errorf("provider %q: timeouts must not be negative", p.ID))
 		}
@@ -327,6 +398,72 @@ func (c *Config) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// validateCloud checks the per-type settings of the cloud provider types
+// and the format of their special credentials. Keys given as "env:NAME"
+// are only checked once resolved, at request time.
+func (p *Provider) validateCloud() []error {
+	var errs []error
+	switch p.Type {
+	case "bedrock":
+		if p.BaseURL != "" && p.BedrockRegion() == "" {
+			errs = append(errs, fmt.Errorf("provider %q: cannot tell the AWS region: use base_url https://bedrock-runtime.<region>.amazonaws.com or set region", p.ID))
+		}
+	case "vertex":
+		if p.Project != "" && !validCloudID(p.Project) {
+			errs = append(errs, fmt.Errorf("provider %q: project %q: want a Google Cloud project id", p.ID, p.Project))
+		}
+	}
+	if p.Region != "" && !validCloudID(p.Region) {
+		errs = append(errs, fmt.Errorf("provider %q: region %q: want e.g. us-east-1 or us-central1", p.ID, p.Region))
+	}
+	for i, k := range p.Keys {
+		switch {
+		case strings.HasPrefix(k, AWSKeyPrefix):
+			if p.Type != "bedrock" {
+				errs = append(errs, fmt.Errorf("provider %q: keys[%d]: aws: credentials are only valid for type bedrock", p.ID, i))
+			} else if err := checkAWSKey(k); err != nil {
+				errs = append(errs, fmt.Errorf("provider %q: keys[%d]: %v", p.ID, i, err))
+			}
+		case strings.HasPrefix(k, ServiceAccountPrefix):
+			ref := strings.TrimPrefix(k, ServiceAccountPrefix)
+			if p.Type != "vertex" {
+				errs = append(errs, fmt.Errorf("provider %q: keys[%d]: sa: service accounts are only valid for type vertex", p.ID, i))
+			} else if ref == "" || ref == "env:" {
+				errs = append(errs, fmt.Errorf("provider %q: keys[%d]: want sa:<path to service-account JSON> or sa:env:<VAR>", p.ID, i))
+			}
+		}
+	}
+	return errs
+}
+
+// checkAWSKey validates "aws:env" or "aws:<id>:<secret>[:<session token>]"
+// without echoing any part of it.
+func checkAWSKey(k string) error {
+	rest := strings.TrimPrefix(k, AWSKeyPrefix)
+	if rest == "env" {
+		return nil
+	}
+	parts := strings.Split(rest, ":")
+	if (len(parts) != 2 && len(parts) != 3) || parts[0] == "" || parts[1] == "" || (len(parts) == 3 && parts[2] == "") {
+		return errors.New("want aws:<ACCESS_KEY_ID>:<SECRET_ACCESS_KEY>[:<SESSION_TOKEN>] or aws:env")
+	}
+	return nil
+}
+
+// validCloudID accepts lowercase letters, digits, '-' and '.', as used by
+// AWS regions, Google Cloud locations and project ids.
+func validCloudID(s string) bool {
+	if s == "" || len(s) > 63 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '.' || c == ':') {
+			return false
+		}
+	}
+	return true
 }
 
 // Secret resolves "env:NAME" references.

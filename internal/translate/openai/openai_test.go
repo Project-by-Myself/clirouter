@@ -149,7 +149,7 @@ func sampleIR() *ir.Request {
 }
 
 func TestEncodeRequestProviders(t *testing.T) {
-	for _, pt := range []string{"openai", "openai-compatible", "deepseek"} {
+	for _, pt := range []string{"openai", "azure-openai", "openai-compatible", "deepseek"} {
 		b, err := EncodeRequest(sampleIR(), ir.EncodeOptions{Model: "up", ProviderType: pt})
 		if err != nil {
 			t.Fatal(err)
@@ -166,7 +166,7 @@ func TestEncodeRequestProviders(t *testing.T) {
 		_, hasPCK := m["prompt_cache_key"]
 		effort, _ := m["reasoning_effort"].(string)
 		switch pt {
-		case "openai":
+		case "openai", "azure-openai":
 			if !hasMCT || hasMT || !hasPCK || effort != "medium" {
 				t.Fatalf("openai: %s", b)
 			}
