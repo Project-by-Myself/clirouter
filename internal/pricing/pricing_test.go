@@ -57,3 +57,32 @@ func TestCostMath(t *testing.T) {
 		t.Fatalf("fallback: %v", got)
 	}
 }
+
+func TestParseLiteLLMAndSyncedLayer(t *testing.T) {
+	raw := []byte(`{
+	  "sample_spec": {"input_cost_per_token": 1},
+	  "claude-sonnet-4-5-20250929": {"input_cost_per_token": 3e-06, "output_cost_per_token": 1.5e-05, "cache_read_input_token_cost": 3e-07, "litellm_provider": "anthropic", "mode": "chat"},
+	  "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {"input_cost_per_token": 9e-06, "output_cost_per_token": 9e-05, "litellm_provider": "bedrock_converse", "mode": "chat"},
+	  "openrouter/new-vendor/shiny-model": {"input_cost_per_token": 2e-06, "output_cost_per_token": 4e-06, "litellm_provider": "openrouter", "mode": "chat"},
+	  "text-embedding-3-small": {"input_cost_per_token": 2e-08, "output_cost_per_token": 0, "litellm_provider": "openai", "mode": "embedding"}
+	}`)
+	got, err := ParseLiteLLM(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := got["claude-sonnet-4-5"]; math.Abs(p.Input-3) > 1e-9 || p.CacheRead == nil || math.Abs(*p.CacheRead-0.3) > 1e-9 {
+		t.Fatalf("first-party price should win: %+v", p)
+	}
+	if _, ok := got["text-embedding-3-small"]; ok {
+		t.Fatal("embedding models must be skipped")
+	}
+	SetSynced(&Synced{Prices: got})
+	defer SetSynced(nil)
+	tab := New(map[string]config.Price{"shiny-model": {Input: 1, Output: 1}})
+	if pr, _ := tab.Lookup("x", "shiny-model", ""); pr.Input != 1 {
+		t.Fatalf("override must beat synced: %+v", pr)
+	}
+	if pr, ok := New(nil).Lookup("or", "new-vendor/shiny-model", ""); !ok || math.Abs(pr.Input-2) > 1e-9 {
+		t.Fatalf("synced model not found: %+v %v", pr, ok)
+	}
+}

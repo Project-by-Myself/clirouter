@@ -48,12 +48,12 @@ var Builtin = map[string]config.Price{
 	"o3":           p(2, 8, 0.5, 0),
 	"o4-mini":      p(1.1, 4.4, 0.275, 0),
 	// Google (≤200k-token prompt tier)
-	"gemini-2.5-pro":        p(1.25, 10, 0.31, -1),
-	"gemini-2.5-flash":      p(0.3, 2.5, 0.075, -1),
-	"gemini-2.5-flash-lite": p(0.1, 0.4, 0.025, -1),
+	"gemini-2.5-pro":        p(1.25, 10, 0.125, -1),
+	"gemini-2.5-flash":      p(0.3, 2.5, 0.03, -1),
+	"gemini-2.5-flash-lite": p(0.1, 0.4, 0.01, -1),
 	// Others
-	"minimax-m2": p(0.3, 1.2, -1, -1),
-	"glm-4.6":    p(0.6, 2.2, -1, -1),
+	"minimax-m2": p(0.3, 1.2, 0.03, 0.375),
+	"glm-4.6":    p(0.6, 2.2, 0.11, -1),
 }
 
 // Usage is the token breakdown of one request. Input includes cache reads
@@ -117,6 +117,13 @@ func (t *Table) Lookup(provider, upModel, reqModel string) (config.Price, bool) 
 		}
 		for _, m := range []string{normalize(upModel), normalize(reqModel)} {
 			if pr, ok := prefixMatch(t.overrides, m); ok && m != "" {
+				return pr, true
+			}
+		}
+	}
+	if sy := synced.Load(); sy != nil {
+		for _, m := range []string{normalize(upModel), normalize(reqModel)} {
+			if pr, ok := sy.Prices[m]; ok && m != "" {
 				return pr, true
 			}
 		}

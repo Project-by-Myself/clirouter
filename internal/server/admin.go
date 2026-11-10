@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -28,6 +30,14 @@ func (s *Server) adminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/providers/usage", a(s.adminProvidersUsage))
 	mux.HandleFunc("GET /admin/api/usage", a(s.adminUsage))
 	mux.HandleFunc("GET /admin/api/pricing", a(s.adminPricing))
+	mux.HandleFunc("POST /admin/api/pricing/sync", a(s.adminPricingSync))
+	mux.HandleFunc("POST /admin/api/alerts/test", a(s.adminTestAlert))
+	mux.HandleFunc("GET /admin/api/keys", a(s.adminListKeys))
+	mux.HandleFunc("POST /admin/api/keys", a(s.adminCreateKey))
+	mux.HandleFunc("GET /admin/api/keys/{name}", a(s.adminGetKey))
+	mux.HandleFunc("PATCH /admin/api/keys/{name}", a(s.adminUpdateKey))
+	mux.HandleFunc("DELETE /admin/api/keys/{name}", a(s.adminDeleteKey))
+	mux.HandleFunc("POST /admin/api/keys/{name}/rotate", a(s.adminRotateKey))
 	if s.OAuthAdmin != nil {
 		mux.Handle("/admin/api/oauth/", a(s.OAuthAdmin.ServeHTTP))
 	}
@@ -154,6 +164,13 @@ func masked(cfg *config.Config) *config.Config {
 	if c.AdminPassword != "" && !strings.HasPrefix(c.AdminPassword, "env:") {
 		c.AdminPassword = keepSecret + ":0:****" // no hint: may be a short, human-chosen password
 	}
+	// Webhook URLs (Slack, Discord…) and bot tokens are credentials too.
+	if v := c.Alerts.WebhookURL; v != "" {
+		c.Alerts.WebhookURL = hide(0, "", v)
+	}
+	if v := c.Alerts.TelegramBotToken; v != "" {
+		c.Alerts.TelegramBotToken = hide(0, "", v)
+	}
 	return &c
 }
 
@@ -217,6 +234,8 @@ func unmask(next, cur *config.Config) {
 		next.APIKeys[i].Key = restore(next.APIKeys[i].Key, curKeys)
 	}
 	next.AdminPassword = restore(next.AdminPassword, []string{cur.AdminPassword})
+	next.Alerts.WebhookURL = restore(next.Alerts.WebhookURL, []string{cur.Alerts.WebhookURL})
+	next.Alerts.TelegramBotToken = restore(next.Alerts.TelegramBotToken, []string{cur.Alerts.TelegramBotToken})
 }
 
 func (s *Server) adminGetConfig(w http.ResponseWriter, r *http.Request) {
@@ -246,13 +265,20 @@ func (s *Server) adminPutConfig(w http.ResponseWriter, r *http.Request) {
 			next.APIKeys[i].CreatedAt = time.Now().Format(time.RFC3339)
 		}
 	}
-	if err := next.Validate(); err != nil {
-		jsonErr(w, http.StatusBadRequest, err.Error())
+	if status, err := s.commit(next); err != nil {
+		jsonErr(w, status, err.Error())
 		return
 	}
+	jsonOK(w, masked(next))
+}
+
+// commit validates next, writes it to disk and makes it live. Caller holds s.mu.
+func (s *Server) commit(next *config.Config) (int, error) {
+	if err := next.Validate(); err != nil {
+		return http.StatusBadRequest, err
+	}
 	if s.Exposed && config.Secret(next.AdminPassword) == "" {
-		jsonErr(w, http.StatusBadRequest, "admin_password cannot be removed while clirouter listens on a non-loopback address")
-		return
+		return http.StatusBadRequest, errors.New("admin_password cannot be removed while clirouter listens on a non-loopback address")
 	}
 	// data_dir defaults to <config dir>/data at load time; do not pin that
 	// derived absolute path into the file.
@@ -261,14 +287,13 @@ func (s *Server) adminPutConfig(w http.ResponseWriter, r *http.Request) {
 		toSave.DataDir = ""
 	}
 	if err := config.Save(s.path, &toSave); err != nil {
-		jsonErr(w, http.StatusInternalServerError, "save failed: "+err.Error())
-		return
+		return http.StatusInternalServerError, fmt.Errorf("save failed: %w", err)
 	}
 	s.swap(next)
 	if fi, err := statPath(s.path); err == nil {
 		s.modTime = fi
 	}
-	jsonOK(w, masked(next))
+	return 0, nil
 }
 
 func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {

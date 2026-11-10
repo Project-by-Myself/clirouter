@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -53,6 +54,43 @@ type Config struct {
 	// Pricing overrides the built-in list prices used for cost estimates.
 	// Keys are "model", "provider/model" or "provider/*".
 	Pricing map[string]Price `yaml:"pricing,omitempty" json:"pricing,omitempty"`
+	Alerts  Alerts           `yaml:"alerts,omitempty" json:"alerts"`
+	// PricingSync refreshes prices from a public list (LiteLLM's by default).
+	PricingSync PricingSync `yaml:"pricing_sync,omitempty" json:"pricing_sync"`
+}
+
+type PricingSync struct {
+	Auto bool   `yaml:"auto,omitempty" json:"auto,omitempty"` // refresh daily
+	URL  string `yaml:"url,omitempty" json:"url,omitempty"`   // LiteLLM-format JSON; empty = LiteLLM's
+}
+
+// Alerts sends notifications when budgets cross thresholds, keys are about
+// to expire or upstream quota runs low. Each channel is optional.
+type Alerts struct {
+	WebhookURL       string `yaml:"webhook_url,omitempty" json:"webhook_url,omitempty"` // POSTed a JSON event
+	TelegramBotToken string `yaml:"telegram_bot_token,omitempty" json:"telegram_bot_token,omitempty"`
+	TelegramChatID   string `yaml:"telegram_chat_id,omitempty" json:"telegram_chat_id,omitempty"`
+	// Thresholds are percentages of a budget that trigger an alert (default 80, 100).
+	Thresholds []int `yaml:"thresholds,omitempty" json:"thresholds,omitempty"`
+	// ExpiryDays warns this many days before a key expires (default 3; -1 = off).
+	ExpiryDays int `yaml:"expiry_days,omitempty" json:"expiry_days,omitempty"`
+	// QuotaPct alerts when an upstream quota window reaches this % used (default 90; -1 = off).
+	QuotaPct int `yaml:"quota_pct,omitempty" json:"quota_pct,omitempty"`
+}
+
+// Enabled reports whether any alert channel is configured.
+func (a *Alerts) Enabled() bool {
+	return a.WebhookURL != "" || (a.TelegramBotToken != "" && a.TelegramChatID != "")
+}
+
+// Levels returns the thresholds (default 80, 100), ascending.
+func (a *Alerts) Levels() []int {
+	if len(a.Thresholds) == 0 {
+		return []int{80, 100}
+	}
+	out := append([]int(nil), a.Thresholds...)
+	sort.Ints(out)
+	return out
 }
 
 // Price is in USD per 1M tokens. Unset cache prices fall back to Input.
@@ -99,6 +137,7 @@ type ClientKey struct {
 	BudgetTokens int64   `yaml:"budget_tokens,omitempty" json:"budget_tokens,omitempty"`
 	BudgetPeriod string  `yaml:"budget_period,omitempty" json:"budget_period,omitempty"`
 	RPM          int     `yaml:"rpm,omitempty" json:"rpm,omitempty"`                   // requests per minute
+	TPM          int64   `yaml:"tpm,omitempty" json:"tpm,omitempty"`                   // tokens (input+output) per minute
 	MaxParallel  int     `yaml:"max_parallel,omitempty" json:"max_parallel,omitempty"` // concurrent requests
 	ExpiresAt    string  `yaml:"expires_at,omitempty" json:"expires_at,omitempty"`     // RFC3339
 	Disabled     bool    `yaml:"disabled,omitempty" json:"disabled,omitempty"`
@@ -295,7 +334,7 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("api key %q: duplicate name", k.Name))
 		}
 		names[k.Name] = true
-		if k.BudgetUSD < 0 || k.BudgetTokens < 0 || k.RPM < 0 || k.MaxParallel < 0 {
+		if k.BudgetUSD < 0 || k.BudgetTokens < 0 || k.RPM < 0 || k.TPM < 0 || k.MaxParallel < 0 {
 			errs = append(errs, fmt.Errorf("api key %q: limits must not be negative", k.Name))
 		}
 		if !validPeriod(k.BudgetPeriod) {
@@ -312,6 +351,19 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("public_url %q: want http(s)://host[:port]", c.PublicURL))
 		}
 		c.PublicURL = strings.TrimRight(c.PublicURL, "/")
+	}
+	if u := c.Alerts.WebhookURL; u != "" && !strings.HasPrefix(u, "env:") {
+		if pu, err := url.Parse(u); err != nil || (pu.Scheme != "http" && pu.Scheme != "https") || pu.Host == "" {
+			errs = append(errs, fmt.Errorf("alerts.webhook_url: want an http(s) URL"))
+		}
+	}
+	if (c.Alerts.TelegramBotToken == "") != (c.Alerts.TelegramChatID == "") {
+		errs = append(errs, fmt.Errorf("alerts: telegram_bot_token and telegram_chat_id must be set together"))
+	}
+	for _, t := range c.Alerts.Thresholds {
+		if t <= 0 || t > 1000 {
+			errs = append(errs, fmt.Errorf("alerts.thresholds: %d is not a percentage between 1 and 1000", t))
+		}
 	}
 	for m, p := range c.Pricing {
 		if p.Input < 0 || p.Output < 0 || (p.CacheRead != nil && *p.CacheRead < 0) || (p.CacheWrite != nil && *p.CacheWrite < 0) {

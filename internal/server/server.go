@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Project-by-Myself/clirouter/internal/alerts"
 	"github.com/Project-by-Myself/clirouter/internal/config"
 	"github.com/Project-by-Myself/clirouter/internal/ir"
 	"github.com/Project-by-Myself/clirouter/internal/proxy"
@@ -55,6 +56,8 @@ func New(path string, cfg *config.Config, st *store.Store, log *slog.Logger, sta
 	s.h = proxy.NewHandler(rt, st)
 	s.h.Usage = usage.New(s.loadUsage)
 	s.h.Usage.Sync(cfg)
+	s.h.Alerts = alerts.New(log)
+	s.applyAlerts(cfg)
 	if fi, err := os.Stat(path); err == nil {
 		s.modTime = fi.ModTime()
 	}
@@ -267,6 +270,7 @@ func (s *Server) swap(cfg *config.Config) {
 	}
 	s.h.SetRuntime(proxy.NewRuntime(cfg, router.New(cfg, old.Router, s.oauth), clients))
 	s.h.Usage.Sync(cfg)
+	s.applyAlerts(cfg)
 }
 
 // Watch polls the config file and reloads on change (no fsnotify dependency;

@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/Project-by-Myself/clirouter/internal/config"
@@ -99,7 +101,71 @@ func (s *Server) adminPricing(w http.ResponseWriter, r *http.Request) {
 	if ov == nil {
 		ov = map[string]config.Price{}
 	}
-	jsonOK(w, map[string]any{"builtin": pricing.Builtin, "overrides": ov})
+	out := map[string]any{"builtin": pricing.Builtin, "overrides": ov}
+	if sy := pricing.Current(); sy != nil {
+		out["synced"] = map[string]any{"source": sy.Source, "updated_at": sy.UpdatedAt, "count": len(sy.Prices)}
+	}
+	if m := r.URL.Query().Get("model"); m != "" {
+		// Price resolution check: ?model=<upstream model>&provider=<id>
+		pr, ok := s.h.Runtime().Pricing.Lookup(r.URL.Query().Get("provider"), m, m)
+		out["lookup"] = map[string]any{"model": m, "found": ok, "price": pr}
+	}
+	jsonOK(w, out)
+}
+
+// syncedPath is where the synced price list is cached.
+func (s *Server) syncedPath() string {
+	return filepath.Join(s.h.Runtime().Cfg.DataDir, "pricing-synced.json")
+}
+
+// SyncPricing fetches the configured price list, caches it and installs it.
+func (s *Server) SyncPricing(ctx context.Context) (*pricing.Synced, error) {
+	sy, err := pricing.Fetch(ctx, s.h.Runtime().Cfg.PricingSync.URL)
+	if err != nil {
+		return nil, err
+	}
+	if err := pricing.SaveFile(s.syncedPath(), sy); err != nil {
+		s.log.Warn("cache synced prices", "err", err)
+	}
+	pricing.SetSynced(sy)
+	return sy, nil
+}
+
+func (s *Server) adminPricingSync(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	sy, err := s.SyncPricing(ctx)
+	if err != nil {
+		jsonErr(w, http.StatusBadGateway, "price sync failed: "+err.Error())
+		return
+	}
+	jsonOK(w, map[string]any{"source": sy.Source, "updated_at": sy.UpdatedAt, "count": len(sy.Prices)})
+}
+
+// RunPricingSync loads the cached list and, when pricing_sync.auto is set,
+// refreshes it daily.
+func (s *Server) RunPricingSync(ctx context.Context) {
+	if err := pricing.LoadFile(s.syncedPath()); err != nil && !os.IsNotExist(err) {
+		s.log.Warn("load synced prices", "err", err)
+	}
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		if s.h.Runtime().Cfg.PricingSync.Auto {
+			if sy := pricing.Current(); sy == nil || time.Since(sy.UpdatedAt) > 24*time.Hour {
+				fctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+				if _, err := s.SyncPricing(fctx); err != nil {
+					s.log.Warn("price sync failed", "err", err)
+				}
+				cancel()
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 type keyLimits struct {
@@ -107,6 +173,7 @@ type keyLimits struct {
 	BudgetTokens int64   `json:"budget_tokens"`
 	BudgetPeriod string  `json:"budget_period"`
 	RPM          int     `json:"rpm"`
+	TPM          int64   `json:"tpm"`
 	MaxParallel  int     `json:"max_parallel"`
 }
 
@@ -143,7 +210,7 @@ func (s *Server) keyInfo(w http.ResponseWriter, r *http.Request) {
 		if k.ExpiresAt != "" {
 			out["expires_at"] = k.ExpiresAt
 		}
-		out["limits"] = keyLimits{BudgetUSD: k.BudgetUSD, BudgetTokens: k.BudgetTokens, BudgetPeriod: config.NormPeriod(k.BudgetPeriod), RPM: k.RPM, MaxParallel: k.MaxParallel}
+		out["limits"] = keyLimits{BudgetUSD: k.BudgetUSD, BudgetTokens: k.BudgetTokens, BudgetPeriod: config.NormPeriod(k.BudgetPeriod), RPM: k.RPM, TPM: k.TPM, MaxParallel: k.MaxParallel}
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	jsonOK(w, out)

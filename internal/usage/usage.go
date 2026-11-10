@@ -49,7 +49,28 @@ type subject struct {
 	today      Totals
 	inflight   int
 	recent     []time.Time // admitted request times within the last minute
+	tokens     []tokEvent  // finished requests' token counts within the last minute
 	lastUsed   time.Time
+}
+
+type tokEvent struct {
+	t time.Time
+	n int64
+}
+
+// pruneTokens drops token events older than a minute and returns the sum. Caller holds mu.
+func (s *subject) pruneTokens(now time.Time) int64 {
+	cut := now.Add(-time.Minute)
+	i := 0
+	for i < len(s.tokens) && !s.tokens[i].t.After(cut) {
+		i++
+	}
+	s.tokens = s.tokens[i:]
+	var sum int64
+	for _, e := range s.tokens {
+		sum += e.n
+	}
+	return sum
 }
 
 // Tracker is safe for concurrent use.
@@ -165,6 +186,12 @@ func (t *Tracker) Add(kind Kind, name string, u Totals) {
 	s.cur.add(u)
 	s.today.add(u)
 	s.lastUsed = now
+	if n := u.Input + u.Output; n > 0 {
+		s.tokens = append(s.tokens, tokEvent{now, n})
+		if len(s.tokens) > 4096 { // bound memory under extreme load
+			s.tokens = s.tokens[len(s.tokens)-4096:]
+		}
+	}
 	t.mu.Unlock()
 }
 
@@ -181,10 +208,21 @@ func (t *Tracker) OverBudget(kind Kind, name string, usd float64, tokens int64) 
 	return (usd > 0 && cur.Cost >= usd) || (tokens > 0 && cur.Input+cur.Output >= tokens)
 }
 
-// Acquire admits a request under rpm and maxParallel (0 = unlimited). On
-// success the caller must call release when the request ends. Otherwise
-// retryAfter tells the client when to retry.
-func (t *Tracker) Acquire(kind Kind, name string, rpm, maxParallel int) (release func(), retryAfter time.Duration, ok bool) {
+// Limit is why Acquire refused a request.
+type Limit byte
+
+const (
+	LimitNone Limit = iota
+	LimitRPM
+	LimitTPM
+	LimitParallel
+)
+
+// Acquire admits a request under rpm, tpm (tokens per minute, counted when
+// requests finish) and maxParallel; 0 = unlimited. On success the caller
+// must call release when the request ends. Otherwise retryAfter tells the
+// client when to retry and limit which cap was hit.
+func (t *Tracker) Acquire(kind Kind, name string, rpm int, tpm int64, maxParallel int) (release func(), retryAfter time.Duration, limit Limit) {
 	now := t.now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -196,10 +234,23 @@ func (t *Tracker) Acquire(kind Kind, name string, rpm, maxParallel int) (release
 	}
 	s.recent = s.recent[i:]
 	if rpm > 0 && len(s.recent) >= rpm {
-		return nil, s.recent[0].Add(time.Minute).Sub(now) + time.Second, false
+		return nil, s.recent[0].Add(time.Minute).Sub(now) + time.Second, LimitRPM
+	}
+	if tpm > 0 {
+		if used := s.pruneTokens(now); used >= tpm {
+			// Retry once enough of the window has expired to fall under the cap.
+			var freed int64
+			for _, e := range s.tokens {
+				freed += e.n
+				if used-freed < tpm {
+					return nil, e.t.Add(time.Minute).Sub(now) + time.Second, LimitTPM
+				}
+			}
+			return nil, time.Minute, LimitTPM
+		}
 	}
 	if maxParallel > 0 && s.inflight >= maxParallel {
-		return nil, time.Second, false
+		return nil, time.Second, LimitParallel
 	}
 	s.recent = append(s.recent, now)
 	s.inflight++
@@ -210,7 +261,7 @@ func (t *Tracker) Acquire(kind Kind, name string, rpm, maxParallel int) (release
 			s.inflight--
 			t.mu.Unlock()
 		})
-	}, 0, true
+	}, 0, LimitNone
 }
 
 // Snapshot is a subject's current state.
@@ -222,6 +273,7 @@ type Snapshot struct {
 	Today    Totals     `json:"today"`
 	Inflight int        `json:"inflight"`
 	RPMNow   int        `json:"rpm_now"`
+	TPMNow   int64      `json:"tpm_now"`
 	LastUsed *time.Time `json:"last_used,omitempty"`
 }
 
@@ -241,6 +293,7 @@ func (t *Tracker) Snapshot(kind Kind, name string) Snapshot {
 			snap.RPMNow++
 		}
 	}
+	snap.TPMNow = s.pruneTokens(now)
 	if !s.lastUsed.IsZero() {
 		lu := s.lastUsed
 		snap.LastUsed = &lu

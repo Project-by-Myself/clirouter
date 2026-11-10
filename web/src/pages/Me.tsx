@@ -226,7 +226,7 @@ function Usage({ info }: { info: KeyInfo }) {
         <div>
           <h3 style={{ marginBottom: 6 }}>{t("me.rate")}</h3>
           <span className="muted small">
-            {[l.rpm ? t("keys.rpm", { n: l.rpm }) : "", l.max_parallel ? t("keys.parallel", { n: l.max_parallel }) : ""].filter(Boolean).join(" · ") || t("keys.noLimit")}
+            {[l.rpm ? t("keys.rpm", { n: l.rpm }) : "", l.tpm ? t("keys.tpm", { n: fmtNum(l.tpm) }) : "", l.max_parallel ? t("keys.parallel", { n: l.max_parallel }) : ""].filter(Boolean).join(" · ") || t("keys.noLimit")}
           </span>
         </div>
       </div>

@@ -174,6 +174,17 @@ Their own view: `http://<public-url>/me`, or
 curl -H "Authorization: Bearer $KEY" http://<public-url>/v1/key/info
 ```
 
+Automating it (e.g. from a script or CI), with the admin password if one is set:
+
+```bash
+curl -X POST http://127.0.0.1:8317/admin/api/keys \
+  -H "Authorization: Bearer $CLIROUTER_ADMIN_PASSWORD" \
+  -d '{"name":"alice","models":["coding"],"budget_usd":20,"rpm":60,"tpm":200000,"expires_in":"30d"}'
+# → {"name":"alice","key":"sk-clr-…", "status":"active", …}   (key shown only here)
+
+curl -X PATCH http://127.0.0.1:8317/admin/api/keys/alice -d '{"disabled":true}'
+```
+
 ## Configuration
 
 Everything lives in `~/.clirouter/config.yaml`. The dashboard edits the same file. Values written
@@ -195,6 +206,7 @@ api_keys:                       # client keys; empty = only this machine may cal
     budget_tokens: 0                      # input+output token cap per period (0 = none)
     budget_period: monthly                # daily | weekly | monthly | total
     rpm: 60                               # requests per minute
+    tpm: 200000                           # tokens (input+output) per minute
     max_parallel: 4                       # concurrent requests
     expires_at: 2026-12-31T23:59:59+07:00
     disabled: false
@@ -240,6 +252,17 @@ logging:
   retention_days: 14
   capture_bodies: false     # store bodies of failed requests for debugging
 
+pricing_sync:
+  auto: true                # refresh prices daily from LiteLLM's public list (off by default)
+
+alerts:                     # optional notifications
+  webhook_url: env:ALERT_WEBHOOK          # JSON POST (Slack, Discord, n8n…)
+  telegram_bot_token: env:TG_BOT_TOKEN
+  telegram_chat_id: "-1001234567890"
+  thresholds: [80, 100]     # % of a key/provider budget
+  expiry_days: 3            # warn before a key expires (-1 = off)
+  quota_pct: 90             # warn when an upstream quota window reaches 90% (-1 = off)
+
 pricing:                    # USD per 1M tokens; overrides the built-in list prices
   claude-sonnet-4-5: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }
   openrouter/z-ai/glm-4.6: { input: 0.6, output: 2.2 }
@@ -254,11 +277,12 @@ client receives an error in its own API format:
 | Key disabled or expired | 401 | `authentication_error` |
 | Model not in the key's `models` | 403 | `permission_error` |
 | Budget for the period reached | 402 | `billing_error` |
-| `rpm` or `max_parallel` exceeded | 429 + `Retry-After` | `rate_limit_error` |
+| `rpm`, `tpm` or `max_parallel` exceeded | 429 + `Retry-After` | `rate_limit_error` |
 | Every provider for the model over its budget | 402 | `billing_error` |
 
-Budgets use **estimated** cost. Prices come from the built-in table, can be overridden under
-`pricing:`, and are listed under **Settings → Pricing**. Unknown models count tokens but cost $0.
+Budgets use **estimated** cost. Prices resolve in this order: your `pricing:` overrides, then
+the synced list (when **Settings → Pricing → Sync now** has been used or `pricing_sync.auto` is
+on; about 1,500 models from LiteLLM's price list), then the built-in table. Unknown models count tokens but cost $0.
 Periods follow the server's local calendar, with weeks starting on Monday. Usage is tracked by
 key **name**, so renaming a key starts its counters from zero.
 
@@ -313,7 +337,12 @@ logged.
 | `GET` | `/admin/api/keys/usage` | Per client key: status, current-period and today's usage, in-flight, RPM |
 | `GET` | `/admin/api/providers/usage` | Per provider: current-period spend, over-budget flag |
 | `GET` | `/admin/api/usage?range=7d\|30d\|90d&group=key\|model\|provider[&key=]` | Usage and estimated cost from the daily rollup, with a per-day series |
-| `GET` | `/admin/api/pricing` | Built-in list prices and configured overrides |
+| `GET` | `/admin/api/pricing[?model=&provider=]` | Built-in, synced and override prices; optional lookup of one model |
+| `POST` | `/admin/api/pricing/sync` | Fetch the price list now |
+| `GET` · `POST` | `/admin/api/keys` | List client keys / create one (the plaintext key is returned **once**) |
+| `GET` · `PATCH` · `DELETE` | `/admin/api/keys/{name}` | Read / update limits / delete a key |
+| `POST` | `/admin/api/keys/{name}/rotate` | Issue a new key value; the old one stops working |
+| `POST` | `/admin/api/alerts/test` | Send a test notification to the configured channels |
 | `POST` | `/admin/api/oauth/start` · `/complete` | Start/finish an OAuth login (redirect, paste-code or device flow) |
 | `GET` | `/admin/api/oauth/status?flow_id=` | Poll a login flow |
 | `GET` · `DELETE` | `/admin/api/oauth/accounts[/{id}]` | List / remove stored OAuth accounts |

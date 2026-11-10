@@ -7,8 +7,8 @@ import type { Key } from "../dict";
 import { useT, type TFn } from "../i18n";
 import { Icon } from "../icons";
 import { diffConfig, useConfig } from "../store";
-import type { Config, Logging, Price, Routing, Timeouts } from "../types";
-import { Badge, ErrorNote, Field, Switch, useConfirm } from "../ui";
+import type { Alerts, Config, Logging, Price, Routing, Timeouts } from "../types";
+import { Badge, ErrorNote, Field, Switch, useConfirm, useToast } from "../ui";
 import { clone, fmtDuration, isMasked, maskHint, parseDuration } from "../util";
 
 const TIMEOUTS: (keyof Timeouts)[] = ["connect", "first_byte", "idle", "total", "early_ping", "keepalive"];
@@ -38,6 +38,8 @@ interface Draft {
   timeouts: Record<keyof Timeouts, string>;
   routing: { strategy: string; max_attempts: string; session_affinity: boolean; max_body_mb: string };
   logging: { level: string; retention_days: string; capture_bodies: boolean };
+  alerts: { webhook_url: string; telegram_bot_token: string; telegram_chat_id: string; thresholds: string; expiry_days: string; quota_pct: string };
+  pricing_auto: boolean;
 }
 
 function toDraft(c: Config): Draft {
@@ -51,7 +53,22 @@ function toDraft(c: Config): Draft {
     timeouts: to,
     routing: { strategy: c.routing.strategy, max_attempts: String(c.routing.max_attempts), session_affinity: c.routing.session_affinity, max_body_mb: String(c.routing.max_body_mb) },
     logging: { level: c.logging.level || "info", retention_days: String(c.logging.retention_days), capture_bodies: c.logging.capture_bodies },
+    alerts: {
+      webhook_url: c.alerts.webhook_url || "",
+      telegram_bot_token: c.alerts.telegram_bot_token || "",
+      telegram_chat_id: c.alerts.telegram_chat_id || "",
+      thresholds: (c.alerts.thresholds || []).join(", "),
+      expiry_days: c.alerts.expiry_days ? String(c.alerts.expiry_days) : "",
+      quota_pct: c.alerts.quota_pct ? String(c.alerts.quota_pct) : "",
+    },
+    pricing_auto: !!c.pricing_sync.auto,
   };
+}
+
+function parseThresholds(s: string): number[] | null {
+  if (!s.trim()) return [];
+  const out = s.split(/[\s,]+/).filter(Boolean).map(Number);
+  return out.every((n) => Number.isInteger(n) && n > 0 && n <= 1000) ? out : null;
 }
 
 const intOk = (s: string) => /^\d+$/.test(s.trim());
@@ -65,6 +82,11 @@ function validate(d: Draft, t: TFn): Record<string, string> {
   if (!intOk(d.routing.max_body_mb)) e.max_body_mb = t("val.int");
   if (!intOk(d.logging.retention_days)) e.retention_days = t("val.int");
   if (d.public_url.trim() && !/^https?:\/\/[^\s/]+/.test(d.public_url.trim())) e.public_url = t("val.url");
+  const wh = d.alerts.webhook_url.trim();
+  if (wh && !isMasked(wh) && !wh.startsWith("env:") && !/^https?:\/\/[^\s/]+/.test(wh)) e.webhook = t("val.url");
+  if (!!d.alerts.telegram_bot_token.trim() !== !!d.alerts.telegram_chat_id.trim()) e.telegram = t("set.alertsTgBoth");
+  if (parseThresholds(d.alerts.thresholds) === null) e.thresholds = t("set.alertsThresholdsErr");
+  for (const k of ["expiry_days", "quota_pct"] as const) if (d.alerts[k].trim() && !/^-?\d+$/.test(d.alerts[k].trim())) e[k] = t("val.int");
   const seen = new Set<string>();
   for (const r of d.pricing) {
     const m = r.model.trim();
@@ -97,6 +119,17 @@ function apply(c: Config, d: Draft): Config {
   const l: Logging = { level: d.logging.level, retention_days: parseInt(d.logging.retention_days, 10) || 0, capture_bodies: d.logging.capture_bodies };
   n.routing = r;
   n.logging = l;
+  const a: Alerts = {};
+  if (d.alerts.webhook_url.trim()) a.webhook_url = d.alerts.webhook_url.trim();
+  if (d.alerts.telegram_bot_token.trim()) a.telegram_bot_token = d.alerts.telegram_bot_token.trim();
+  if (d.alerts.telegram_chat_id.trim()) a.telegram_chat_id = d.alerts.telegram_chat_id.trim();
+  const th = parseThresholds(d.alerts.thresholds);
+  if (th && th.length) a.thresholds = th;
+  if (d.alerts.expiry_days.trim()) a.expiry_days = parseInt(d.alerts.expiry_days, 10) || 0;
+  if (d.alerts.quota_pct.trim()) a.quota_pct = parseInt(d.alerts.quota_pct, 10) || 0;
+  n.alerts = a;
+  n.pricing_sync = { ...(c.pricing_sync || {}), auto: d.pricing_auto || undefined };
+  if (!n.pricing_sync.auto) delete n.pricing_sync.auto;
   return n;
 }
 
@@ -294,7 +327,9 @@ export default function Settings() {
           </div>
         </section>
 
-        <PricingCard rows={draft.pricing} onChange={(r) => set("pricing", r)} error={errs.pricing} />
+        <AlertsCard draft={draft} set={set} errs={errs} saved={config.alerts} dirty={changes.some((c) => c.includes("alerts"))} />
+
+        <PricingCard rows={draft.pricing} onChange={(r) => set("pricing", r)} error={errs.pricing} auto={draft.pricing_auto} setAuto={(v) => set("pricing_auto", v)} />
       </div>
 
       {(changes.length > 0 || serverErr) && (
@@ -335,9 +370,82 @@ export default function Settings() {
   );
 }
 
-function PricingCard({ rows, onChange, error }: { rows: PriceRow[]; onChange: (r: PriceRow[]) => void; error?: string }) {
+function AlertsCard({ draft, set, errs, saved, dirty }: { draft: Draft; set: <K extends keyof Draft>(k: K, v: Draft[K]) => void; errs: Record<string, string>; saved: Alerts; dirty: boolean }) {
   const t = useT();
+  const toast = useToast();
+  const [testing, setTesting] = useState(false);
+  const a = draft.alerts;
+  const up = (k: keyof Draft["alerts"], v: string) => set("alerts", { ...a, [k]: v });
+  const configured = !!(saved.webhook_url || (saved.telegram_bot_token && saved.telegram_chat_id));
+  const test = async () => {
+    setTesting(true);
+    try {
+      await api.testAlert();
+      toast({ kind: "ok", title: t("set.alertsTestOk") });
+    } catch (e) {
+      toast({ kind: "err", title: t("set.alertsTestFail"), body: (e as Error).message });
+    } finally {
+      setTesting(false);
+    }
+  };
+  const secret = (v: string) => (isMasked(v) ? maskHint(v) : "");
+  return (
+    <section className="card">
+      <div className="card-head">
+        <h2 className="grow">{t("set.alerts")}</h2>
+        <button className="btn sm" onClick={test} disabled={!configured || dirty || testing} title={dirty ? t("set.alertsSaveFirst") : !configured ? t("set.alertsNone") : undefined}>
+          <Icon name="send" size={13} /> {testing ? t("int.testing") : t("set.alertsTest")}
+        </button>
+      </div>
+      <div className="card-body stack">
+        <p className="muted small">{t("set.alertsHint")}</p>
+        <div className="grid-2">
+          <Field label={t("set.alertsWebhook")} hint={secret(a.webhook_url) ? t("set.savedSecret", { hint: secret(a.webhook_url) }) : t("set.alertsWebhookHint")} error={errs.webhook}>
+            {(id, d) => <input id={id} aria-describedby={d} className="input mono" value={isMasked(a.webhook_url) ? "" : a.webhook_url} placeholder={isMasked(a.webhook_url) ? "••••••" : "https://hooks.slack.com/services/…"} onChange={(e) => up("webhook_url", e.target.value)} autoComplete="off" />}
+          </Field>
+          <div className="grid-2" style={{ gap: 12 }}>
+            <Field label={t("set.alertsTgToken")} hint={secret(a.telegram_bot_token) ? t("set.savedSecret", { hint: secret(a.telegram_bot_token) }) : t("set.alertsTgTokenHint")} error={errs.telegram}>
+              {(id, d) => <input id={id} aria-describedby={d} className="input mono" type="password" value={isMasked(a.telegram_bot_token) ? "" : a.telegram_bot_token} placeholder={isMasked(a.telegram_bot_token) ? "••••••" : "123456:ABC…"} onChange={(e) => up("telegram_bot_token", e.target.value)} autoComplete="off" />}
+            </Field>
+            <Field label={t("set.alertsTgChat")} hint={t("set.alertsTgChatHint")}>
+              {(id, d) => <input id={id} aria-describedby={d} className="input mono" value={a.telegram_chat_id} placeholder="-1001234567890" onChange={(e) => up("telegram_chat_id", e.target.value)} />}
+            </Field>
+          </div>
+        </div>
+        <div className="grid-3">
+          <Field label={t("set.alertsThresholds")} hint={t("set.alertsThresholdsHint")} error={errs.thresholds}>
+            {(id, d) => <input id={id} aria-describedby={d} className="input mono" value={a.thresholds} placeholder="80, 100" onChange={(e) => up("thresholds", e.target.value)} />}
+          </Field>
+          <Field label={t("set.alertsExpiry")} hint={t("set.alertsExpiryHint")} error={errs.expiry_days}>
+            {(id, d) => <input id={id} aria-describedby={d} className="input num" inputMode="numeric" value={a.expiry_days} placeholder="3" onChange={(e) => up("expiry_days", e.target.value)} />}
+          </Field>
+          <Field label={t("set.alertsQuota")} hint={t("set.alertsQuotaHint")} error={errs.quota_pct}>
+            {(id, d) => <input id={id} aria-describedby={d} className="input num" inputMode="numeric" value={a.quota_pct} placeholder="90" onChange={(e) => up("quota_pct", e.target.value)} />}
+          </Field>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function PricingCard({ rows, onChange, error, auto, setAuto }: { rows: PriceRow[]; onChange: (r: PriceRow[]) => void; error?: string; auto: boolean; setAuto: (v: boolean) => void }) {
+  const t = useT();
+  const toast = useToast();
   const info = usePoll((sig) => api.pricing(sig), 0);
+  const [syncing, setSyncing] = useState(false);
+  const sync = async () => {
+    setSyncing(true);
+    try {
+      const r = await api.syncPricing();
+      toast({ kind: "ok", title: t("set.syncOk", { n: r.count }) });
+      info.refresh();
+    } catch (e) {
+      toast({ kind: "err", title: t("set.syncFail"), body: (e as Error).message });
+    } finally {
+      setSyncing(false);
+    }
+  };
+  const sy = info.data?.synced;
   const [q, setQ] = useState("");
   const builtin = useMemo(() => {
     const b = Object.entries(info.data?.builtin || {}).sort(([a], [b2]) => a.localeCompare(b2));
@@ -360,6 +468,17 @@ function PricingCard({ rows, onChange, error }: { rows: PriceRow[]; onChange: (r
       </div>
       <div className="card-body stack">
         <p className="muted small">{t("set.pricingHint")}</p>
+        <div className="list-row" style={{ flexWrap: "wrap", gap: 10, padding: "10px 12px" }}>
+          <Icon name="refresh" size={14} className="faint" />
+          <div className="grow small" style={{ minWidth: 220 }}>
+            <strong>{t("set.syncTitle")}</strong>{" "}
+            <span className="muted">{sy ? t("set.syncInfo", { n: sy.count, when: new Date(sy.updated_at).toLocaleString() }) : t("set.syncNever")}</span>
+          </div>
+          <Switch checked={auto} onChange={setAuto} label={<span className="small">{t("set.syncAuto")}</span>} />
+          <button className="btn sm" onClick={sync} disabled={syncing}>
+            <Icon name="refresh" size={13} /> {syncing ? t("set.syncing") : t("set.syncNow")}
+          </button>
+        </div>
         {error && <ErrorNote error={error} />}
         {rows.length === 0 ? (
           <p className="faint small">{t("set.noOverrides")}</p>

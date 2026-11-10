@@ -32,10 +32,21 @@ export interface ClientKey {
   budget_tokens?: number;
   budget_period?: BudgetPeriod;
   rpm?: number;
+  tpm?: number;
   max_parallel?: number;
   expires_at?: string;
   disabled?: boolean;
   created_at?: string;
+}
+
+/** Fields accepted by POST/PATCH /admin/api/keys. */
+export type KeyPatch = Partial<Omit<ClientKey, "key" | "created_at">> & { expires_in?: string };
+
+/** A key as returned by the key management API (key only after create/rotate). */
+export interface KeyView extends Omit<ClientKey, "key"> {
+  key?: string;
+  key_hint: string;
+  status: string;
 }
 
 export interface Price {
@@ -104,6 +115,17 @@ export interface Config {
   aliases: Record<string, string>;
   public_url?: string;
   pricing?: Record<string, Price>;
+  alerts: Alerts;
+  pricing_sync: { auto?: boolean; url?: string };
+}
+
+export interface Alerts {
+  webhook_url?: string;
+  telegram_bot_token?: string;
+  telegram_chat_id?: string;
+  thresholds?: number[];
+  expiry_days?: number;
+  quota_pct?: number;
 }
 
 export interface AccountStatus {
@@ -257,6 +279,7 @@ export interface KeyUsage extends UsageTotals {
   today: UsageTotals;
   inflight: number;
   rpm_now: number;
+  tpm_now?: number;
   last_used?: string;
 }
 
@@ -293,6 +316,7 @@ export interface UsageReport {
 export interface PricingInfo {
   builtin: Record<string, Price>;
   overrides: Record<string, Price>;
+  synced?: { source: string; updated_at: string; count: number };
 }
 
 export interface KeyInfo {
@@ -301,7 +325,7 @@ export interface KeyInfo {
   status: KeyStatus;
   models: string[];
   expires_at?: string;
-  limits: { budget_usd: number; budget_tokens: number; budget_period: BudgetPeriod; rpm: number; max_parallel: number };
+  limits: { budget_usd: number; budget_tokens: number; budget_period: BudgetPeriod; rpm: number; tpm?: number; max_parallel: number };
   usage: UsageTotals & { period_start: string; period_end?: string };
   today: UsageTotals;
 }

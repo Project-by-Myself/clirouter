@@ -44,28 +44,49 @@ func TestBudgetRolloverAndLimits(t *testing.T) {
 		t.Fatal("budget did not reset")
 	}
 	// RPM and parallel caps.
-	r1, _, ok := tr.Acquire(Key, "a", 2, 1)
-	if !ok {
+	r1, _, lim := tr.Acquire(Key, "a", 2, 0, 1)
+	if lim != LimitNone {
 		t.Fatal("first")
 	}
-	if _, wait, ok := tr.Acquire(Key, "a", 2, 1); ok || wait <= 0 {
+	if _, wait, lim := tr.Acquire(Key, "a", 2, 0, 1); lim != LimitParallel || wait <= 0 {
 		t.Fatal("parallel cap not applied")
 	}
 	r1()
 	r1() // idempotent
-	r2, _, ok := tr.Acquire(Key, "a", 2, 1)
-	if !ok {
+	r2, _, lim := tr.Acquire(Key, "a", 2, 0, 1)
+	if lim != LimitNone {
 		t.Fatal("second")
 	}
 	r2()
-	if _, wait, ok := tr.Acquire(Key, "a", 2, 0); ok || wait < time.Minute-time.Second {
-		t.Fatalf("rpm cap not applied: ok=%v wait=%v", ok, wait)
+	if _, wait, lim := tr.Acquire(Key, "a", 2, 0, 0); lim != LimitRPM || wait < time.Minute-time.Second {
+		t.Fatalf("rpm cap not applied: lim=%v wait=%v", lim, wait)
 	}
 	now = now.Add(61 * time.Second)
-	if _, _, ok := tr.Acquire(Key, "a", 2, 0); !ok {
+	if _, _, lim := tr.Acquire(Key, "a", 2, 0, 0); lim != LimitNone {
 		t.Fatal("rpm window did not slide")
 	}
 	if snap := tr.Snapshot(Key, "a"); snap.Inflight != 1 || snap.Period != "daily" {
 		t.Fatalf("snapshot %+v", snap)
+	}
+}
+
+func TestTPM(t *testing.T) {
+	now := time.Now()
+	tr := New(nil)
+	tr.now = func() time.Time { return now }
+	tr.Add(Key, "k", Totals{Requests: 1, Input: 600, Output: 100})
+	now = now.Add(20 * time.Second)
+	tr.Add(Key, "k", Totals{Requests: 1, Input: 300})
+	if _, wait, lim := tr.Acquire(Key, "k", 0, 1000, 0); lim != LimitTPM || wait < 39*time.Second || wait > 42*time.Second {
+		t.Fatalf("tpm: lim=%v wait=%v", lim, wait)
+	}
+	now = now.Add(41 * time.Second) // first event (700 tokens) left the window
+	r, _, lim := tr.Acquire(Key, "k", 0, 1000, 0)
+	if lim != LimitNone {
+		t.Fatalf("tpm window did not slide: %v", lim)
+	}
+	r()
+	if s := tr.Snapshot(Key, "k"); s.TPMNow != 300 {
+		t.Fatalf("tpm_now = %d", s.TPMNow)
 	}
 }

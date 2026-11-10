@@ -18,6 +18,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
+	"github.com/Project-by-Myself/clirouter/internal/alerts"
 	"github.com/Project-by-Myself/clirouter/internal/config"
 	"github.com/Project-by-Myself/clirouter/internal/ir"
 	"github.com/Project-by-Myself/clirouter/internal/pricing"
@@ -52,6 +53,7 @@ type Handler struct {
 	Store   *store.Store
 	Metrics *Metrics
 	Usage   *usage.Tracker
+	Alerts  *alerts.Notifier // optional
 }
 
 func NewHandler(rt *Runtime, st *store.Store) *Handler {
@@ -87,15 +89,86 @@ func (h *Handler) admit(rt *Runtime, keyName, model string) (func(), *admitErr) 
 	if h.Usage.OverBudget(usage.Key, k.Name, k.BudgetUSD, k.BudgetTokens) {
 		return nil, &admitErr{status: http.StatusPaymentRequired, typ: "billing_error", msg: fmt.Sprintf("API key %q reached its %s budget", k.Name, config.NormPeriod(k.BudgetPeriod))}
 	}
-	release, wait, ok := h.Usage.Acquire(usage.Key, k.Name, k.RPM, k.MaxParallel)
-	if !ok {
-		msg := fmt.Sprintf("API key %q is limited to %d requests per minute", k.Name, k.RPM)
-		if k.MaxParallel > 0 && (k.RPM == 0 || wait <= time.Second) {
+	release, wait, lim := h.Usage.Acquire(usage.Key, k.Name, k.RPM, k.TPM, k.MaxParallel)
+	if lim != usage.LimitNone {
+		var msg string
+		switch lim {
+		case usage.LimitRPM:
+			msg = fmt.Sprintf("API key %q is limited to %d requests per minute", k.Name, k.RPM)
+		case usage.LimitTPM:
+			msg = fmt.Sprintf("API key %q is limited to %d tokens per minute", k.Name, k.TPM)
+		default:
 			msg = fmt.Sprintf("API key %q is limited to %d concurrent requests", k.Name, k.MaxParallel)
 		}
 		return nil, &admitErr{status: http.StatusTooManyRequests, typ: "rate_limit_error", msg: msg, retryAfter: wait}
 	}
 	return release, nil
+}
+
+// BudgetAlerts announces the highest budget threshold crossed by a key or
+// provider in the current period. With prime, thresholds already crossed are
+// only marked as sent (after a restart or config change).
+func (h *Handler) BudgetAlerts(rt *Runtime, keyName, provider string, prime bool) {
+	levels := rt.Cfg.Alerts.Levels()
+	check := func(kind usage.Kind, name, what string, budgetUSD float64, budgetTokens int64) {
+		if budgetUSD <= 0 && budgetTokens <= 0 {
+			return
+		}
+		snap := h.Usage.Snapshot(kind, name)
+		pct := alerts.Pct(snap.Cost, snap.Input+snap.Output, budgetUSD, budgetTokens)
+		top := -1
+		for i, l := range levels {
+			if pct >= float64(l) {
+				top = i
+			}
+		}
+		if top < 0 {
+			return
+		}
+		keyOf := func(l int) string {
+			return fmt.Sprintf("budget|%c|%s|%s|%d", kind, name, snap.PeriodStart.Format(time.RFC3339), l)
+		}
+		for i := 0; i < top; i++ {
+			h.Alerts.Mark(keyOf(levels[i]))
+		}
+		if prime {
+			h.Alerts.Mark(keyOf(levels[top]))
+			return
+		}
+		used := fmt.Sprintf("$%.2f", snap.Cost)
+		limit := fmt.Sprintf("$%.2f", budgetUSD)
+		if budgetUSD <= 0 {
+			used, limit = fmt.Sprintf("%d tokens", snap.Input+snap.Output), fmt.Sprintf("%d tokens", budgetTokens)
+		}
+		reset := "never (total budget)"
+		if snap.PeriodEnd != nil {
+			reset = snap.PeriodEnd.Format("2006-01-02 15:04")
+		}
+		icon, tail := "⚠️", "Resets "+reset+"."
+		if pct >= 100 {
+			icon, tail = "⛔", "Requests are refused until "+reset+"."
+			if kind == usage.Provider {
+				tail = "The router now skips this provider until " + reset + "."
+			}
+		}
+		ev := alerts.Event{Kind: "budget", Subject: name, Threshold: levels[top],
+			Text: fmt.Sprintf("%s clirouter: %s %q has used %.0f%% of its %s budget (%s / %s). %s", icon, what, name, pct, snap.Period, used, limit, tail),
+			Data: map[string]any{"kind": what, "period": snap.Period, "pct": pct, "cost_usd": snap.Cost, "tokens": snap.Input + snap.Output, "budget_usd": budgetUSD, "budget_tokens": budgetTokens, "period_end": snap.PeriodEnd}}
+		if kind == usage.Provider {
+			ev.Kind = "provider_budget"
+		}
+		h.Alerts.Once(keyOf(levels[top]), ev)
+	}
+	if k := rt.Keys[keyName]; k != nil {
+		check(usage.Key, k.Name, "key", k.BudgetUSD, k.BudgetTokens)
+	}
+	if provider != "" {
+		for i := range rt.Cfg.Providers {
+			if p := &rt.Cfg.Providers[i]; p.ID == provider {
+				check(usage.Provider, p.ID, "provider", p.BudgetUSD, 0)
+			}
+		}
+	}
 }
 
 // withinBudget drops targets whose provider has reached its spend cap.
@@ -698,6 +771,9 @@ func (c *call) finish() {
 		c.h.Usage.Add(usage.Key, c.rec.ClientKey, u)
 		if c.rec.Provider != "" {
 			c.h.Usage.Add(usage.Provider, c.rec.Provider, u)
+		}
+		if c.h.Alerts != nil && c.rt.Cfg.Alerts.Enabled() && u.Cost+float64(u.Input+u.Output) > 0 {
+			c.h.BudgetAlerts(c.rt, c.rec.ClientKey, c.rec.Provider, false)
 		}
 	}
 	c.h.Metrics.observe(&c.rec)

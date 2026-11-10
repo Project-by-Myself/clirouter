@@ -115,6 +115,7 @@ func main() {
 		fatal(log, fmt.Errorf("open store: %w", err))
 	}
 	// One-time: price existing request history and build the usage rollup.
+	_ = pricing.LoadFile(filepath.Join(cfg.DataDir, "pricing-synced.json"))
 	ptab := pricing.New(cfg.Pricing)
 	if err := st.Backfill(context.Background(), func(provider, up, model string, in, out, cr, cw int64) float64 {
 		return ptab.Cost(provider, up, model, pricing.Usage{Input: in, Output: out, CacheRead: cr, CacheWrite: cw})
@@ -132,6 +133,8 @@ func main() {
 	srv.ListenAddr = addr
 	stop := make(chan struct{})
 	go srv.Watch(stop)
+	go srv.RunAlerts(actx)
+	go srv.RunPricingSync(actx)
 
 	hs := &http.Server{
 		Addr:              addr,

@@ -146,6 +146,8 @@ export function diffConfig(a: Config, b: Config, t: TFn): string[] {
     else if (!eq(apr[m], bp2[m])) out.push(`~ ${t("diff.price")} ${m}`);
   }
   if ((a.admin_password || "") !== (b.admin_password || "")) out.push(`~ admin_password`);
+  if (!eq(a.alerts || {}, b.alerts || {})) out.push(`~ alerts`);
+  if (!eq(a.pricing_sync || {}, b.pricing_sync || {})) out.push(`~ pricing_sync`);
   for (const sec of ["timeouts", "routing", "logging"] as const) {
     const x = a[sec] as unknown as Record<string, unknown>;
     const y = b[sec] as unknown as Record<string, unknown>;

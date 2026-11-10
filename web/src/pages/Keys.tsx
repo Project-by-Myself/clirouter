@@ -8,9 +8,9 @@ import { useNow, usePoll, useStored } from "../hooks";
 import { useT, type TFn } from "../i18n";
 import { Icon } from "../icons";
 import { useConfig, useStatus } from "../store";
-import { BUDGET_PERIODS, type BudgetPeriod, type ClientKey, type Config, type KeyStatus, type KeyUsage } from "../types";
-import { Badge, CopyButton, Drawer, Empty, ErrorNote, Field, Meter, Switch, useConfirm, type Tone } from "../ui";
-import { clone, endOfDayISO, fmtAgo, fmtNum, fmtUsd, isLoopbackListen, isMasked, maskHint, publicBase, randomKey, toDateInput } from "../util";
+import { BUDGET_PERIODS, type BudgetPeriod, type ClientKey, type Config, type KeyPatch, type KeyStatus, type KeyUsage } from "../types";
+import { Badge, CopyButton, Drawer, Empty, ErrorNote, Field, Meter, Switch, useConfirm, useToast, type Tone } from "../ui";
+import { endOfDayISO, fmtAgo, fmtNum, fmtUsd, isLoopbackListen, isMasked, maskHint, publicBase, toDateInput } from "../util";
 
 /* ---------- helpers ---------- */
 
@@ -34,6 +34,7 @@ export function limitsSummary(k: ClientKey, t: TFn): string[] {
   if (k.budget_usd) out.push(t("keys.msg.budget", { v: fmtUsd(k.budget_usd), p }));
   if (k.budget_tokens) out.push(t("keys.msg.tokens", { v: fmtNum(k.budget_tokens), p }));
   if (k.rpm) out.push(t("keys.rpm", { n: k.rpm }));
+  if (k.tpm) out.push(t("keys.tpm", { n: fmtNum(k.tpm) }));
   if (k.max_parallel) out.push(t("keys.parallel", { n: k.max_parallel }));
   if (k.expires_at) out.push(t("keys.msg.expires", { d: toDateInput(k.expires_at) }));
   return out;
@@ -95,6 +96,7 @@ interface Form {
   budget_tokens: string;
   budget_period: BudgetPeriod;
   rpm: string;
+  tpm: string;
   max_parallel: string;
   expires: string;
   disabled: boolean;
@@ -110,6 +112,7 @@ function toForm(k: ClientKey | null, n: number): Form {
     budget_tokens: k?.budget_tokens ? String(k.budget_tokens) : "",
     budget_period: k?.budget_period || "monthly",
     rpm: k?.rpm ? String(k.rpm) : "",
+    tpm: k?.tpm ? String(k.tpm) : "",
     max_parallel: k?.max_parallel ? String(k.max_parallel) : "",
     expires: toDateInput(k?.expires_at),
     disabled: !!k?.disabled,
@@ -119,20 +122,19 @@ function toForm(k: ClientKey | null, n: number): Form {
 const num = (s: string) => (s.trim() === "" ? 0 : Number(s));
 const badNum = (s: string) => s.trim() !== "" && !(Number.isFinite(Number(s)) && Number(s) >= 0);
 
-type Errors = Partial<Record<"name" | "budget_usd" | "budget_tokens" | "rpm" | "max_parallel", string>>;
+type Errors = Partial<Record<"name" | "budget_usd" | "budget_tokens" | "rpm" | "tpm" | "max_parallel", string>>;
 
 function validate(f: Form, cfg: Config, t: TFn): Errors {
   const e: Errors = {};
   const n = f.name.trim();
   if (!n) e.name = t("val.required");
   else if (n !== f.origName && cfg.api_keys.some((k) => k.name === n)) e.name = t("val.kvDup", { k: n });
-  for (const k of ["budget_usd", "budget_tokens", "rpm", "max_parallel"] as const) if (badNum(f[k])) e[k] = t("val.nonNeg");
+  for (const k of ["budget_usd", "budget_tokens", "rpm", "tpm", "max_parallel"] as const) if (badNum(f[k])) e[k] = t("val.nonNeg");
   return e;
 }
 
-function fromForm(f: Form, base: ClientKey): ClientKey {
+function toPatch(f: Form): KeyPatch {
   return {
-    ...base,
     name: f.name.trim(),
     note: f.note.trim(),
     models: f.models,
@@ -140,6 +142,7 @@ function fromForm(f: Form, base: ClientKey): ClientKey {
     budget_tokens: Math.round(num(f.budget_tokens)),
     budget_period: f.budget_period,
     rpm: Math.round(num(f.rpm)),
+    tpm: Math.round(num(f.tpm)),
     max_parallel: Math.round(num(f.max_parallel)),
     expires_at: endOfDayISO(f.expires),
     disabled: f.disabled,
@@ -156,7 +159,8 @@ interface ShareState {
 export default function Keys() {
   const t = useT();
   const confirm = useConfirm();
-  const { config, error, loading, save, models } = useConfig();
+  const { config, error, loading, reload, models, reloadModels } = useConfig();
+  const toast = useToast();
   const { status } = useStatus();
   const usage = usePoll((s) => api.keysUsage(s), 5000);
   const month = usePoll((s) => api.usage({ range: "30d", group: "key" }, s), 30000);
@@ -174,28 +178,34 @@ export default function Keys() {
   const tokensPeriod = (usage.data || []).reduce((a, u) => a + u.input_tokens + u.output_tokens, 0);
   const reqToday = (usage.data || []).reduce((a, u) => a + (u.today?.requests || 0), 0);
 
-  const saveKeys = async (next: ClientKey[]) => {
-    const c = clone(config);
-    c.api_keys = next;
-    return save(c);
+  // Each action uses the key management API (one key at a time), so it
+  // cannot overwrite unrelated edits made elsewhere.
+  const run = async <T,>(fn: () => Promise<T>, okTitle: string): Promise<{ ok: boolean; error?: string; value?: T }> => {
+    try {
+      const value = await fn();
+      await reload();
+      reloadModels();
+      usage.refresh();
+      toast({ kind: "ok", title: okTitle });
+      return { ok: true, value };
+    } catch (e) {
+      const msg = (e as Error).message;
+      toast({ kind: "err", title: t("save.fail"), body: msg });
+      return { ok: false, error: msg };
+    }
   };
 
-  const toggle = async (k: ClientKey) => {
-    await saveKeys(keys.map((x) => (x.name === k.name ? { ...x, disabled: !x.disabled } : x)));
-    usage.refresh();
-  };
+  const toggle = (k: ClientKey) => run(() => api.updateKey(k.name, { disabled: !k.disabled }), k.disabled ? t("keys.enabledToast", { name: k.name }) : t("keys.disabledToast", { name: k.name }));
 
   const remove = async (k: ClientKey) => {
     if (!(await confirm({ title: t("keys.deleteTitle", { name: k.name }), body: t("keys.deleteBody"), confirm: t("common.delete"), danger: true }))) return;
-    await saveKeys(keys.filter((x) => x.name !== k.name));
-    usage.refresh();
+    await run(() => api.deleteKey(k.name), t("keys.deletedToast", { name: k.name }));
   };
 
   const rotate = async (k: ClientKey) => {
     if (!(await confirm({ title: t("keys.rotateTitle", { name: k.name }), body: t("keys.rotateBody"), confirm: t("keys.rotate") }))) return;
-    const fresh = randomKey();
-    const r = await saveKeys(keys.map((x) => (x.name === k.name ? { ...x, key: fresh } : x)));
-    if (r.ok) setShare({ name: k.name, key: fresh });
+    const r = await run(() => api.rotateKey(k.name), t("keys.rotatedToast", { name: k.name }));
+    if (r.ok && r.value?.key) setShare({ name: k.name, key: r.value.key });
   };
 
   return (
@@ -284,9 +294,10 @@ export default function Keys() {
                         <UsageCell k={k} u={u} />
                       </td>
                       <td className="hide-sm small nowrap">
-                        {k.rpm || k.max_parallel ? (
+                        {k.rpm || k.tpm || k.max_parallel ? (
                           <div className="col" style={{ gap: 2 }}>
                             {k.rpm ? <span>{t("keys.rpm", { n: k.rpm })}</span> : null}
+                            {k.tpm ? <span>{t("keys.tpm", { n: fmtNum(k.tpm) })}</span> : null}
                             {k.max_parallel ? <span className="faint">{t("keys.parallel", { n: k.max_parallel })}</span> : null}
                           </div>
                         ) : (
@@ -339,16 +350,15 @@ export default function Keys() {
           suggestions={models.map((m) => m.id)}
           onClose={() => setEditing(null)}
           onSave={async (f) => {
-            const base = f.origName ? keys.find((k) => k.name === f.origName)! : ({ name: "", key: randomKey() } as ClientKey);
-            const next = fromForm(f, base);
-            const list = f.origName ? keys.map((k) => (k.name === f.origName ? next : k)) : [...keys, next];
-            const r = await saveKeys(list);
+            const patch = toPatch(f);
+            const r = f.origName
+              ? await run(() => api.updateKey(f.origName!, patch), t("save.ok"))
+              : await run(() => api.createKey(patch), t("keys.createdToast", { name: patch.name || "" }));
             if (r.ok) {
               setEditing(null);
-              usage.refresh();
-              if (!f.origName) setShare({ name: next.name, key: base.key });
+              if (!f.origName && r.value?.key) setShare({ name: r.value.name, key: r.value.key });
             }
-            return r;
+            return { ok: r.ok, error: r.error };
           }}
         />
       )}
@@ -444,7 +454,7 @@ function KeyDrawer({
     setBusy(false);
     if (!r.ok) setServerErr(r.error);
   };
-  const numInput = (k: "budget_usd" | "budget_tokens" | "rpm" | "max_parallel", label: string, hint: string, ph = "0") => (
+  const numInput = (k: "budget_usd" | "budget_tokens" | "rpm" | "tpm" | "max_parallel", label: string, hint: string, ph = "0") => (
     <Field label={label} hint={hint} error={show(k)}>
       {(id, d) => <input id={id} aria-describedby={d} aria-invalid={!!show(k)} className="input num" inputMode="decimal" value={form[k]} placeholder={ph} onChange={(e) => set(k, e.target.value)} />}
     </Field>
@@ -506,6 +516,7 @@ function KeyDrawer({
         <div className="section-title">{t("keys.rateSec")}</div>
         <div className="grid-3">
           {numInput("rpm", t("keys.rpmLabel"), t("keys.zeroUnlimited"))}
+          {numInput("tpm", t("keys.tpmLabel"), t("keys.tpmHint"))}
           {numInput("max_parallel", t("keys.parallelLabel"), t("keys.zeroUnlimited"))}
           <Field label={t("keys.expires")} hint={t("keys.expiresHint")}>
             {(id, d) => (

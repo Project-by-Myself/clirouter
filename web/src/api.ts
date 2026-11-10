@@ -1,4 +1,4 @@
-import type { AccountStatus, ClientKey, Config, KeyUsage, ModelInfo, OAuthAccount, OAuthFlowStatus, OAuthStart, PricingInfo, Provider, ProviderUsage, RecordT, Stats, Status, UsageReport } from "./types";
+import type { AccountStatus, ClientKey, Config, KeyPatch, KeyUsage, KeyView, ModelInfo, OAuthAccount, OAuthFlowStatus, OAuthStart, PricingInfo, Provider, ProviderUsage, RecordT, Stats, Status, UsageReport } from "./types";
 
 function normProvider(p: Provider): Provider {
   return {
@@ -43,6 +43,8 @@ export function normalizeConfig(c: Config): Config {
     aliases: c.aliases || {},
     public_url: c.public_url || "",
     pricing: c.pricing || {},
+    alerts: c.alerts || {},
+    pricing_sync: c.pricing_sync || {},
   };
 }
 
@@ -154,6 +156,12 @@ export const api = {
       by_key: x.by_key || [],
       timeline: x.timeline || [],
     })),
+  createKey: (p: KeyPatch) => req<KeyView>("POST", "/admin/api/keys", p),
+  updateKey: (name: string, p: KeyPatch) => req<KeyView>("PATCH", `/admin/api/keys/${enc(name)}`, p),
+  rotateKey: (name: string) => req<KeyView>("POST", `/admin/api/keys/${enc(name)}/rotate`),
+  deleteKey: (name: string) => req<{ ok: boolean }>("DELETE", `/admin/api/keys/${enc(name)}`),
+  testAlert: () => req<{ ok: boolean }>("POST", "/admin/api/alerts/test"),
+  syncPricing: () => req<{ source: string; updated_at: string; count: number }>("POST", "/admin/api/pricing/sync"),
   keysUsage: (s?: AbortSignal) => req<KeyUsage[] | null>("GET", "/admin/api/keys/usage", undefined, s).then((x) => x || []),
   providersUsage: (s?: AbortSignal) => req<ProviderUsage[] | null>("GET", "/admin/api/providers/usage", undefined, s).then((x) => x || []),
   usage: (q: { range: string; group: string; key?: string }, s?: AbortSignal) => {
@@ -161,7 +169,7 @@ export const api = {
     if (q.key) p.set("key", q.key);
     return req<UsageReport>("GET", `/admin/api/usage?${p}`, undefined, s).then((x) => ({ ...x, rows: x.rows || [], daily: x.daily || [] }));
   },
-  pricing: (s?: AbortSignal) => req<PricingInfo>("GET", "/admin/api/pricing", undefined, s).then((x) => ({ builtin: x.builtin || {}, overrides: x.overrides || {} })),
+  pricing: (s?: AbortSignal) => req<PricingInfo>("GET", "/admin/api/pricing", undefined, s).then((x) => ({ builtin: x.builtin || {}, overrides: x.overrides || {}, synced: x.synced })),
   models: (s?: AbortSignal) => req<ModelInfo[]>("GET", "/admin/api/models", undefined, s),
   oauthStart: (b: { type: string; account_id?: string; project_id?: string }) => req<OAuthStart>("POST", "/admin/api/oauth/start", b),
   oauthComplete: (flow_id: string, code: string) => req<OAuthAccount>("POST", "/admin/api/oauth/complete", { flow_id, code }),
