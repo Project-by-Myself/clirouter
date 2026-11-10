@@ -359,6 +359,14 @@ func (c *call) run(ctx context.Context, targets []router.Target) {
 			}
 		}
 		if last == nil {
+			// If every account is benched because the upstream does not
+			// serve this model, say so: a 429 would make agents retry forever.
+			if reason, ok := modelGone(targets, excluded); ok {
+				msg := fmt.Sprintf("model %q is not available on any configured account (%s); use the dashboard's Reset to retry sooner", c.model, reason)
+				c.errMsg = msg
+				c.out.fail(http.StatusNotFound, "not_found_error", msg, 0, nil)
+				return
+			}
 			msg := fmt.Sprintf("all accounts for %q are cooling down", c.model)
 			c.errMsg = msg
 			c.out.fail(http.StatusTooManyRequests, "rate_limit_error", msg, max(minWait, time.Second), nil)
@@ -372,6 +380,29 @@ func (c *call) run(ctx context.Context, targets []router.Target) {
 		c.out.fail(status, last.Type, last.Message, last.RetryAfter, nil)
 		return
 	}
+}
+
+// modelGone reports whether every candidate account of every target is
+// benched because its upstream rejected the model, with one such reason.
+func modelGone(targets []router.Target, excluded map[exclusion]bool) (string, bool) {
+	reason, any := "", false
+	for _, t := range targets {
+		ex := excludedFor(excluded, t.Model)
+		for _, a := range t.Provider.Accounts {
+			if ex[a] {
+				continue
+			}
+			r, ok := a.ModelUnavailable(t.Model)
+			if !ok {
+				return "", false
+			}
+			if reason == "" {
+				reason = r
+			}
+			any = true
+		}
+	}
+	return reason, any
 }
 
 // failure extends upstream.Failure with the raw upstream body for fatal

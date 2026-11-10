@@ -504,12 +504,14 @@ These are deliberately left out:
 
 ## Known limitations
 
-- **Subscription (OAuth) providers.** The Codex, Claude, Copilot and Gemini CLI login flows are
-  implemented but **not yet verified against the live services**. clirouter doesn't impersonate
-  first-party clients, so a provider may reject requests: Anthropic may accept subscription
-  tokens only from Claude Code, Codex may require its official `instructions`, and Copilot may
-  reject a non-VS Code `Editor-Version`. Using a subscription through a proxy may also violate
-  the provider's terms; your call.
+- **Subscription (OAuth) providers.** Verified with a real Claude Pro/Max account: login, token
+  refresh, the 5h/7d usage windows, and **Claude Haiku 4.5** in every client format, streaming
+  and not. **Sonnet and Opus are refused (404 "model not found")** for subscription tokens
+  unless the request impersonates Claude Code. clirouter deliberately does not do that (see
+  Non-goals); use an API key for those models. When this happens, clirouter keeps answering 404
+  with the reason instead of a retryable 429. The Codex, Copilot and Gemini CLI flows are
+  implemented but not yet verified against the live services. Using a subscription through a
+  proxy may violate the provider's terms; your call.
 - Not supported yet: Cursor/Kiro as upstreams, Codex WebSocket transport, AWS STS
   assume-role / instance roles, Azure Entra ID tokens and GCP Application Default Credentials.
   Bedrock, Azure OpenAI and Vertex were tested against mocks only.

@@ -1,6 +1,7 @@
 package router
 
 import (
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -125,7 +126,7 @@ func parseQuota(h http.Header, now time.Time) []QuotaWindow {
 					continue
 				}
 				if f <= 1 {
-					f *= 100
+					f = math.Round(f*10000) / 100 // 0.28 → 28 (not 28.000000000000004)
 				}
 				w := QuotaWindow{Name: win, UsedPct: pct(f)}
 				if t, ok := parseReset(get("anthropic-ratelimit-unified-"+win+"-reset"), now); ok {

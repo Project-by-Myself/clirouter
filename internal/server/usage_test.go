@@ -205,3 +205,29 @@ func TestPricingOverridesAndCostInStats(t *testing.T) {
 		t.Fatalf("pricing: %s", pr)
 	}
 }
+
+// After an upstream "model not found", later requests must keep getting a
+// 404 with the reason, not a retryable 429 "cooling down".
+func TestModelNotFoundStays404(t *testing.T) {
+	var hits atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `{"type":"error","error":{"type":"not_found_error","message":"model: claude-sonnet-4-5"}}`)
+	}))
+	defer up.Close()
+	cfg := config.Default()
+	cfg.Providers = []config.Provider{{ID: "sub", Type: "anthropic", BaseURL: up.URL, Keys: []string{"k"}}}
+	_, hs, st := usageServer(t, t.TempDir(), cfg)
+	defer st.Close()
+	for i := 0; i < 3; i++ {
+		c, body := msg(t, hs.URL, "", "claude-sonnet-4-5")
+		if c != http.StatusNotFound || !strings.Contains(body, "claude-sonnet-4-5") {
+			t.Fatalf("request %d: %d %s", i, c, body)
+		}
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("upstream hit %d times; the model cooldown should spare it", hits.Load())
+	}
+}

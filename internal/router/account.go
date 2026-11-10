@@ -38,6 +38,7 @@ type state struct {
 	mu         sync.Mutex
 	until      time.Time
 	modelUntil map[string]time.Time
+	modelGone  map[string]string // model → upstream reason, for "model not found" cooldowns
 	fails      int
 	lastErr    string
 	lastErrAt  time.Time
@@ -49,7 +50,24 @@ type state struct {
 	quotaErr   string
 }
 
-func newState() *state { return &state{modelUntil: map[string]time.Time{}} }
+func newState() *state {
+	return &state{modelUntil: map[string]time.Time{}, modelGone: map[string]string{}}
+}
+
+// ModelUnavailable reports whether the account is cooling down for model
+// because the upstream said the model does not exist or is not enabled,
+// and returns the upstream's reason.
+func (a *Account) ModelUnavailable(model string) (string, bool) {
+	s := a.st
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u, ok := s.modelUntil[model]; ok && time.Now().Before(u) {
+		if r, ok := s.modelGone[model]; ok {
+			return r, true
+		}
+	}
+	return "", false
+}
 
 func (s *state) wait(model string, now time.Time) time.Duration {
 	s.mu.Lock()
@@ -70,6 +88,7 @@ func (a *Account) MarkSuccess(model string) {
 	s.successes++
 	s.lastUsed = time.Now()
 	delete(s.modelUntil, model)
+	delete(s.modelGone, model)
 	s.mu.Unlock()
 }
 
@@ -121,6 +140,11 @@ func (a *Account) MarkFailure(model string, kind FailureKind, retryAfter time.Du
 	}
 	if modelScoped {
 		s.modelUntil[model] = now.Add(d)
+		if kind == FailModel {
+			s.modelGone[model] = s.lastErr
+		} else {
+			delete(s.modelGone, model)
+		}
 	} else {
 		s.until = now.Add(d)
 	}
@@ -140,6 +164,7 @@ func (a *Account) Reset() {
 	s.mu.Lock()
 	s.until = time.Time{}
 	s.modelUntil = map[string]time.Time{}
+	s.modelGone = map[string]string{}
 	s.fails = 0
 	s.mu.Unlock()
 }
