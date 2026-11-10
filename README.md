@@ -61,7 +61,7 @@ Trang **Kết nối** trong dashboard sinh sẵn snippet theo cấu hình hiện
 
 `POST /v1/messages` (+`/count_tokens`) · `POST /v1/chat/completions` · `POST /v1/responses` ·
 `POST /v1beta/models/{model}:streamGenerateContent|generateContent` · `GET /v1/models` ·
-`GET /healthz` · `GET /metrics` (Prometheus) · `/admin/api/*` (dashboard).
+`GET /healthz` · `GET /metrics` (Prometheus, cần client key như `/v1/models`) · `/admin/api/*` (dashboard).
 
 ## Chọn model
 
@@ -126,6 +126,47 @@ Config được theo dõi và nạp lại nóng (2 s), không cần restart (tr�
 - **Session affinity:** các lượt cùng hội thoại dính một account để giữ prompt cache.
 - **Pool kết nối HTTP/2** dùng chung theo proxy, tắt gzip upstream (gzip làm SSE bị dồn cục).
 - **Credential OAuth mã hoá AES-256-GCM**, ghi file nguyên tử, refresh single-flight + chạy nền.
+
+## Bảo mật
+
+clirouter giữ API key/token OAuth của mọi provider, nên mặc định khoá chặt:
+
+- **Bind `127.0.0.1:8317`.** Khi chưa có `api_keys`, API suy luận chỉ nhận request trực tiếp từ
+  máy này. Khi chưa có `admin_password`, dashboard/admin API cũng chỉ mở cho localhost — và chỉ
+  khi Host là `localhost`/`127.0.0.1`/`[::1]` (chặn DNS rebinding), không có header reverse proxy
+  (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`).
+- **Mở ra mạng (`listen: 0.0.0.0:8317` hoặc `--listen`)**: nếu chưa đặt `admin_password`, lần
+  khởi động đầu clirouter tự sinh mật khẩu ngẫu nhiên và ghi vào `config.yaml` (không in ra log) —
+  đọc nó trong file config rồi nhập ở dashboard. Muốn tự đặt: `admin_password: env:CLIROUTER_ADMIN_PASSWORD`.
+  Hãy thêm `api_keys` để máy khác dùng được API suy luận. Không gỡ được mật khẩu qua dashboard khi đang expose.
+- **Admin API** nhận `Authorization: Bearer <admin_password>`, so sánh constant-time, khoá IP 5 phút
+  sau 10 lần sai; từ chối mọi request trình duyệt khác origin (`Origin`/`Sec-Fetch-Site`), không bật CORS.
+  Dashboard trả CSP, `X-Frame-Options: DENY`, `nosniff`.
+- **Client key** so sánh constant-time, khoá IP 1 phút sau 30 lần sai. Key tạo/lưu qua dashboard
+  được lưu dạng băm `sha256:<hex>` (chỉ hiện một lần lúc tạo — hãy copy ngay); có thể tự ghi
+  `key: sha256:$(printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1)` vào config.
+- **Quyền file**: `~/.clirouter` 0700, `config.yaml` 0600, `data/` 0700, `clirouter.db` 0600, token
+  OAuth trong `data/auth/` mã hoá AES-256-GCM (khoá ở `data/auth/.key`, 0600). Khi khởi động, file
+  có quyền lỏng hơn sẽ được siết lại. Key provider trong `config.yaml` là plaintext — dùng `env:NAME`
+  nếu không muốn ghi key ra đĩa.
+- **Không log secret**: log chỉ ghi tên client key; thông báo lỗi upstream (kể cả bản lưu SQLite và
+  `last_error` của tài khoản) được che các chuỗi giống key/token. Admin API chỉ trả 4 ký tự cuối của key.
+- **Upstream** không follow redirect (Authorization không bị mang sang host khác).
+- **Giới hạn đầu vào**: body tối đa `routing.max_body_mb` (kể cả sau giải nén gzip/zstd), header 1 MB
+  và 10 s, body phải gửi xong trong 2 phút, mỗi lần ghi cho client tối đa 2 phút.
+
+**Đưa ra Internet**: đặt sau reverse proxy có TLS (Caddy/nginx), luôn đặt `admin_password` và
+`api_keys`, để clirouter bind `127.0.0.1` và chỉ proxy cổng đó. Ví dụ Caddy:
+
+```
+llm.example.com {
+    reverse_proxy 127.0.0.1:8317 {
+        flush_interval -1   # không buffer SSE
+    }
+}
+```
+
+Báo lỗ hổng: xem [SECURITY.md](SECURITY.md).
 
 ## Không làm (có chủ đích)
 
