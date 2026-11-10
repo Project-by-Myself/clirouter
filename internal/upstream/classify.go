@@ -34,7 +34,16 @@ type Failure struct {
 
 // Classify interprets a non-2xx upstream response.
 func Classify(status int, h http.Header, body []byte, oauth bool) Failure {
-	f := Failure{Status: status, Message: ErrorMessage(body), RetryAfter: RetryAfter(h, body)}
+	f := Failure{Status: status, Message: ErrorMessage(body)}
+	if status == 429 || status == 402 {
+		f.RetryAfter = RetryAfter(h, body)
+	} else {
+		// Rate-limit reset headers (x-ratelimit-reset-*, anthropic-ratelimit-*)
+		// come with every response and describe quota windows, not this
+		// error: honoring them would bench an account for minutes after a
+		// single 5xx. Only an explicit Retry-After asks to back off.
+		f.RetryAfter = explicitRetryAfter(h)
+	}
 	if f.Message == "" {
 		f.Message = http.StatusText(status)
 	}
@@ -106,8 +115,8 @@ func errorMessage(body []byte) string {
 	return s
 }
 
-// RetryAfter reads standard and provider-specific reset hints.
-func RetryAfter(h http.Header, body []byte) time.Duration {
+// explicitRetryAfter reads Retry-After / Retry-After-Ms only.
+func explicitRetryAfter(h http.Header) time.Duration {
 	if v := h.Get("Retry-After"); v != "" {
 		if s, err := strconv.ParseFloat(v, 64); err == nil && s > 0 {
 			return time.Duration(s * float64(time.Second))
@@ -122,6 +131,14 @@ func RetryAfter(h http.Header, body []byte) time.Duration {
 		if ms, err := strconv.ParseFloat(v, 64); err == nil && ms > 0 {
 			return time.Duration(ms * float64(time.Millisecond))
 		}
+	}
+	return 0
+}
+
+// RetryAfter reads standard and provider-specific reset hints.
+func RetryAfter(h http.Header, body []byte) time.Duration {
+	if d := explicitRetryAfter(h); d > 0 {
+		return d
 	}
 	for _, k := range []string{"Anthropic-Ratelimit-Unified-Reset", "Anthropic-Ratelimit-Requests-Reset", "Anthropic-Ratelimit-Tokens-Reset"} {
 		if v := h.Get(k); v != "" {

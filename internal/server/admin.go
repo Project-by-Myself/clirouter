@@ -1,8 +1,10 @@
 package server
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -96,10 +98,14 @@ func (s *Server) adminStatus(w http.ResponseWriter, r *http.Request) {
 	if s.store != nil {
 		dropped = s.store.Dropped()
 	}
+	listen := rt.Cfg.Listen
+	if s.ListenAddr != "" {
+		listen = s.ListenAddr
+	}
 	jsonOK(w, map[string]any{
 		"version":          Version,
 		"uptime_s":         int64(time.Since(s.started).Seconds()),
-		"listen":           rt.Cfg.Listen,
+		"listen":           listen,
 		"config_path":      s.path,
 		"metrics":          s.h.Metrics.Snapshot(),
 		"dropped_records":  dropped,
@@ -112,12 +118,14 @@ func (s *Server) adminStatus(w http.ResponseWriter, r *http.Request) {
 
 const keepSecret = "__keep__"
 
-// masked returns a copy of cfg with secrets replaced by "__keep__:<index>:<hint>".
+// masked returns a copy of cfg with secrets replaced by
+// "__keep__:<index>[@<hex owner id>]:<hint>". Provider keys carry the id of
+// the provider they belong to, so renaming a provider keeps its keys.
 func masked(cfg *config.Config) *config.Config {
 	b, _ := json.Marshal(cfg)
 	var c config.Config
 	json.Unmarshal(b, &c)
-	hide := func(i int, v string) string {
+	hide := func(i int, owner, v string) string {
 		if strings.HasPrefix(v, "env:") {
 			return v
 		}
@@ -125,15 +133,19 @@ func masked(cfg *config.Config) *config.Config {
 		if len(v) >= 16 { // only the last 4 characters, and only of long secrets
 			hint = "…" + v[len(v)-4:]
 		}
-		return keepSecret + ":" + strconv.Itoa(i) + ":" + hint
+		ref := strconv.Itoa(i)
+		if owner != "" {
+			ref += "@" + hex.EncodeToString([]byte(owner))
+		}
+		return keepSecret + ":" + ref + ":" + hint
 	}
 	for pi := range c.Providers {
 		for i, k := range c.Providers[pi].Keys {
-			c.Providers[pi].Keys[i] = hide(i, k)
+			c.Providers[pi].Keys[i] = hide(i, c.Providers[pi].ID, k)
 		}
 	}
 	for i, k := range c.APIKeys {
-		c.APIKeys[i].Key = hide(i, k.Key)
+		c.APIKeys[i].Key = hide(i, "", k.Key)
 	}
 	if c.AdminPassword != "" && !strings.HasPrefix(c.AdminPassword, "env:") {
 		c.AdminPassword = keepSecret + ":0:****" // no hint: may be a short, human-chosen password
@@ -143,13 +155,33 @@ func masked(cfg *config.Config) *config.Config {
 
 // unmask restores "__keep__:<index>:..." placeholders from the current config.
 func unmask(next, cur *config.Config) {
-	restore := func(v string, pool []string) string {
+	// parse splits a placeholder's "<index>[@<hex owner id>]" reference.
+	parse := func(v string) (idx int, owner string, hasOwner, ok bool) {
 		rest, ok := strings.CutPrefix(v, keepSecret+":")
+		if !ok {
+			return 0, "", false, false
+		}
+		ref, _, _ := strings.Cut(rest, ":")
+		ref, ownerHex, hasOwner := strings.Cut(ref, "@")
+		if hasOwner {
+			b, err := hex.DecodeString(ownerHex)
+			if err != nil {
+				return -1, "", false, true
+			}
+			owner = string(b)
+		}
+		i, err := strconv.Atoi(ref)
+		if err != nil {
+			i = -1
+		}
+		return i, owner, hasOwner, true
+	}
+	restore := func(v string, pool []string) string {
+		i, _, _, ok := parse(v)
 		if !ok {
 			return v
 		}
-		idx, _, _ := strings.Cut(rest, ":")
-		if i, err := strconv.Atoi(idx); err == nil && i >= 0 && i < len(pool) {
+		if i >= 0 && i < len(pool) {
 			return pool[i]
 		}
 		return ""
@@ -159,10 +191,15 @@ func unmask(next, cur *config.Config) {
 		curProv[p.ID] = p
 	}
 	for pi := range next.Providers {
-		pool := curProv[next.Providers[pi].ID].Keys
 		keys := next.Providers[pi].Keys[:0]
 		for _, k := range next.Providers[pi].Keys {
-			if v := restore(k, pool); v != "" {
+			// The placeholder names the provider the key came from, so a
+			// renamed provider still finds its keys.
+			owner := next.Providers[pi].ID
+			if _, o, has, ok := parse(k); ok && has {
+				owner = o
+			}
+			if v := restore(k, curProv[owner].Keys); v != "" {
 				keys = append(keys, v)
 			}
 		}
@@ -210,7 +247,13 @@ func (s *Server) adminPutConfig(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, "admin_password cannot be removed while clirouter listens on a non-loopback address")
 		return
 	}
-	if err := config.Save(s.path, next); err != nil {
+	// data_dir defaults to <config dir>/data at load time; do not pin that
+	// derived absolute path into the file.
+	toSave := *next
+	if toSave.DataDir == filepath.Join(filepath.Dir(s.path), "data") {
+		toSave.DataDir = ""
+	}
+	if err := config.Save(s.path, &toSave); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "save failed: "+err.Error())
 		return
 	}

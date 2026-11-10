@@ -39,6 +39,9 @@ type Server struct {
 	// Exposed is true when the server listens on a non-loopback address; the
 	// admin password can then not be removed from the dashboard.
 	Exposed bool
+	// ListenAddr is the address actually listened on (it differs from the
+	// config's listen when overridden by --listen, which is not persisted).
+	ListenAddr string
 
 	adminFails  *failLimiter
 	clientFails *failLimiter

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -143,6 +144,35 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) Validate() error {
 	var errs []error
+	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
+		errs = append(errs, fmt.Errorf("listen %q: want host:port (%v)", c.Listen, err))
+	}
+	// A zero timeout would fail every request at once (an emptied field in
+	// the dashboard is sent as 0), so zero means "use the default".
+	def := Default()
+	for _, d := range []struct {
+		name   string
+		v      *Duration
+		dflt   Duration
+		zeroOK bool // 0 disables the feature
+	}{
+		{"connect", &c.Timeouts.Connect, def.Timeouts.Connect, false},
+		{"first_byte", &c.Timeouts.FirstByte, def.Timeouts.FirstByte, false},
+		{"idle", &c.Timeouts.Idle, def.Timeouts.Idle, false},
+		{"total", &c.Timeouts.Total, def.Timeouts.Total, false},
+		{"early_ping", &c.Timeouts.EarlyPing, 0, true},
+		{"keepalive", &c.Timeouts.Keepalive, 0, true},
+	} {
+		switch {
+		case *d.v < 0:
+			errs = append(errs, fmt.Errorf("timeouts.%s must not be negative", d.name))
+		case *d.v == 0 && !d.zeroOK:
+			*d.v = d.dflt
+		}
+	}
+	if c.Logging.RetentionDays <= 0 {
+		c.Logging.RetentionDays = def.Logging.RetentionDays
+	}
 	seen := map[string]bool{}
 	for i := range c.Providers {
 		p := &c.Providers[i]
@@ -167,6 +197,9 @@ func (c *Config) Validate() error {
 		p.BaseURL = strings.TrimRight(p.BaseURL, "/")
 		if p.BaseURL == "" {
 			errs = append(errs, fmt.Errorf("provider %q: base_url is required for type %s", p.ID, p.Type))
+		}
+		if p.FirstByte < 0 || p.Idle < 0 {
+			errs = append(errs, fmt.Errorf("provider %q: timeouts must not be negative", p.ID))
 		}
 	}
 	for _, cb := range c.Combos {

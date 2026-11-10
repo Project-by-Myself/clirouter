@@ -84,14 +84,17 @@ func main() {
 	if err != nil {
 		fatal(log, err)
 	}
+	// --listen overrides the address for this run only; cfg keeps the file's
+	// value so a dashboard save does not persist the override.
+	addr := cfg.Listen
 	if *listen != "" {
-		cfg.Listen = *listen
+		addr = *listen
 	}
 	fixPerms(log, *path, cfg.DataDir)
-	exposed := !server.IsLoopbackListen(cfg.Listen)
+	exposed := !server.IsLoopbackListen(addr)
 	if exposed && config.Secret(cfg.AdminPassword) == "" {
 		if cfg.AdminPassword != "" {
-			fatal(log, fmt.Errorf("admin_password refers to %s, which is empty; refusing to expose the admin API on %s", cfg.AdminPassword, cfg.Listen))
+			fatal(log, fmt.Errorf("admin_password refers to %s, which is empty; refusing to expose the admin API on %s", cfg.AdminPassword, addr))
 		}
 		pw, err := randomSecret()
 		if err != nil {
@@ -118,18 +121,19 @@ func main() {
 	srv := server.New(*path, cfg, st, log, web.Handler(), am.TokenSource)
 	srv.OAuthAdmin = am.AdminHandler()
 	srv.Exposed = exposed
+	srv.ListenAddr = addr
 	stop := make(chan struct{})
 	go srv.Watch(stop)
 
 	hs := &http.Server{
-		Addr:              cfg.Listen,
+		Addr:              addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
 	go func() {
-		log.Info("clirouter listening", "addr", cfg.Listen, "dashboard", "http://"+cfg.Listen+"/", "config", *path)
+		log.Info("clirouter listening", "addr", addr, "dashboard", "http://"+addr+"/", "config", *path)
 		if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fatal(log, err)
 		}

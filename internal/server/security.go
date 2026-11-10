@@ -99,11 +99,33 @@ func newFailLimiter(max int, window time.Duration) *failLimiter {
 	return &failLimiter{max: max, window: window, m: map[string]*failCount{}, now: time.Now}
 }
 
+// clientIP is the address failures are counted against. Behind a reverse
+// proxy on this host (the recommended way to expose clirouter) every request
+// arrives from loopback, so throttling the peer address would let one client
+// sending bad credentials lock out everyone. For loopback peers the address
+// reported by the proxy is used instead: the last X-Forwarded-For hop (the
+// one the proxy itself appended) or X-Real-IP.
 func clientIP(r *http.Request) string {
+	host := r.RemoteAddr
 	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return h
+		host = h
 	}
-	return r.RemoteAddr
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		return host
+	}
+	if xff := r.Header.Values("X-Forwarded-For"); len(xff) > 0 {
+		last := xff[len(xff)-1]
+		if i := strings.LastIndexByte(last, ','); i >= 0 {
+			last = last[i+1:]
+		}
+		if ip := net.ParseIP(strings.TrimSpace(last)); ip != nil {
+			return ip.String()
+		}
+	}
+	if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-Ip"))); ip != nil {
+		return ip.String()
+	}
+	return host
 }
 
 // blocked reports whether ip has used up its failures for this window.

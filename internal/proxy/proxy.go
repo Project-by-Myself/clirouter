@@ -53,6 +53,10 @@ func (h *Handler) SetRuntime(r *Runtime) { h.rt.Store(r) }
 // cooldown is about to expire instead of failing immediately.
 const maxCooldownWait = 5 * time.Second
 
+// nonStreamFirstByte is the minimum wait for response headers of a
+// non-streaming upstream request (the official SDKs default to 10 minutes).
+var nonStreamFirstByte = 10 * time.Minute
+
 type call struct {
 	h          *Handler
 	rt         *Runtime
@@ -125,9 +129,28 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, cf ir.Format, ur
 	c.run(ctx, targets)
 }
 
+// exclusion marks an account that already failed during this request. Most
+// failures are specific to the upstream model (rate limit, model missing,
+// overloaded), so a combo falling back to another model may still use the
+// same account; model == "" rules the account out for every model.
+type exclusion struct {
+	a     *router.Account
+	model string
+}
+
+func excludedFor(ex map[exclusion]bool, model string) map[*router.Account]bool {
+	out := make(map[*router.Account]bool, len(ex))
+	for k := range ex {
+		if k.model == "" || k.model == model {
+			out[k.a] = true
+		}
+	}
+	return out
+}
+
 func (c *call) run(ctx context.Context, targets []router.Target) {
 	maxAttempts := max(c.rt.Cfg.Routing.MaxAttempts, 1)
-	excluded := map[*router.Account]bool{}
+	excluded := map[exclusion]bool{}
 	var last *failure
 	attempts := 0
 	waited := false
@@ -136,7 +159,7 @@ func (c *call) run(ctx context.Context, targets []router.Target) {
 	targetsLoop:
 		for _, t := range targets {
 			for attempts < maxAttempts {
-				a, wait := c.rt.Router.Pick(t, c.sessionKey, excluded)
+				a, wait := c.rt.Router.Pick(t, c.sessionKey, excludedFor(excluded, t.Model))
 				if a == nil {
 					if wait > 0 && (minWait < 0 || wait < minWait) {
 						minWait = wait
@@ -153,7 +176,11 @@ func (c *call) run(ctx context.Context, targets []router.Target) {
 					return
 				}
 				last = f
-				excluded[a] = true
+				ex := exclusion{a: a, model: t.Model}
+				if f.Kind == router.FailAuth || f.Kind == router.FailQuota {
+					ex.model = ""
+				}
+				excluded[ex] = true
 				switch f.Action {
 				case upstream.Fatal:
 					c.errMsg = f.Message
@@ -240,6 +267,12 @@ func (c *call) attempt(ctx context.Context, t router.Target, a *router.Account) 
 	firstByte := c.rt.Cfg.Timeouts.FirstByte.D()
 	if d := t.Provider.Cfg.FirstByte.D(); d > 0 {
 		firstByte = d
+	}
+	if !upStream {
+		// A non-streaming upstream sends nothing until the whole completion
+		// is ready, so the first-byte timeout would cap generation time and
+		// re-run a slow but healthy generation on another account.
+		firstByte = max(firstByte, nonStreamFirstByte)
 	}
 	idle := c.rt.Cfg.Timeouts.Idle.D()
 	if d := t.Provider.Cfg.Idle.D(); d > 0 {
@@ -362,12 +395,18 @@ func (c *call) pipePassthrough(r io.Reader) (*failure, bool) {
 	codec := c.codec
 	marker := []byte(codec.UsageMarker)
 	var held []byte
-	committed := false
+	committed, finished := false, false
 	for {
 		ev, err := rd.Next()
 		if err != nil {
 			if !committed {
 				return streamBroke(err), false
+			}
+			if err == io.EOF && finished {
+				// Some OpenAI-compatible servers close the stream after the
+				// finish_reason chunk without sending "data: [DONE]".
+				_ = c.out.writeEvents(doneEvent, true)
+				return nil, true
 			}
 			c.errMsg = "upstream stream ended unexpectedly: " + errText(err)
 			_ = c.out.writeEvents(codec.StreamErrorEvent("api_error", c.errMsg), true)
@@ -377,6 +416,9 @@ func (c *call) pipePassthrough(r io.Reader) (*failure, bool) {
 			if u, ok := codec.UsageFromEvent(ev.Name, ev.Data); ok {
 				c.usage.Merge(u)
 			}
+		}
+		if c.cf == ir.FormatChat && !finished && mayFinish(ev.Data) {
+			finished = chatFinished(ev.Data)
 		}
 		if !committed {
 			if typ, msg, ok := codec.IsErrorEvent(ev.Name, ev.Data); ok {
@@ -496,6 +538,24 @@ func (c *call) pipeTranslated(r io.Reader, upFmt ir.Format) (*failure, bool) {
 	}
 	c.out.writeJSON(http.StatusOK, "application/json", b)
 	return nil, true
+}
+
+var doneEvent = []byte("data: [DONE]\n\n")
+
+// mayFinish cheaply skips the common `"finish_reason":null` chunks so
+// passthrough does not parse every event.
+func mayFinish(data []byte) bool {
+	return bytes.Contains(data, []byte(`"finish_reason":"`)) || bytes.Contains(data, []byte(`"finish_reason": "`))
+}
+
+// chatFinished reports whether a chat.completion.chunk carries a finish_reason.
+func chatFinished(data []byte) bool {
+	for _, r := range gjson.GetBytes(data, "choices.#.finish_reason").Array() {
+		if r.Type == gjson.String && r.Str != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func streamBroke(err error) *failure {
