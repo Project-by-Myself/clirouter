@@ -1,8 +1,8 @@
 import { useMemo, useState, type MouseEvent } from "react";
 import { useWidth } from "./hooks";
 import { useT } from "./i18n";
-import type { Bucket } from "./types";
-import { fmtMs, fmtNum } from "./util";
+import type { Bucket, UsageDay } from "./types";
+import { fmtMs, fmtNum, fmtUsd } from "./util";
 
 export const RANGE_STEP: Record<string, number> = {
   "1h": 5 * 60e3,
@@ -18,7 +18,7 @@ export function fillTimeline(timeline: Bucket[], since: string, range: string, n
   const start = Math.floor(new Date(since).getTime() / step) * step;
   const out: Bucket[] = [];
   for (let k = start; k <= now; k += step) {
-    out.push(byKey.get(k) || { key: String(k), requests: 0, errors: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, avg_ttfb_ms: 0, p95_ttfb_ms: 0 });
+    out.push(byKey.get(k) || { key: String(k), requests: 0, errors: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, avg_ttfb_ms: 0, p95_ttfb_ms: 0, cost_usd: 0 });
     if (out.length > 2000) break;
   }
   return out;
@@ -176,6 +176,99 @@ export function TimelineChart({ data, range, mode, height = 170, label }: Props)
             {t("ov.tokens")}
             <span className="spacer" />
             {fmtNum(hb.input_tokens)} / {fmtNum(hb.output_tokens)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Fills missing calendar days between since and today with zero rows. */
+export function fillDays(daily: UsageDay[], since: string): UsageDay[] {
+  const by = new Map(daily.map((d) => [d.day, d]));
+  const p = (n: number) => String(n).padStart(2, "0");
+  const key = (d: Date) => `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  const start = new Date(since);
+  if (isNaN(start.getTime())) return daily;
+  const cur = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const end = new Date();
+  const out: UsageDay[] = [];
+  while (cur <= end && out.length < 400) {
+    const k = key(cur);
+    out.push(by.get(k) || { day: k, requests: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0 });
+    cur.setDate(cur.getDate() + 1);
+  }
+  return out;
+}
+
+/** Daily estimated-cost bars with a hover tooltip. */
+export function CostBars({ data, height = 180, label }: { data: UsageDay[]; height?: number; label: string }) {
+  const t = useT();
+  const [ref, width] = useWidth<HTMLDivElement>();
+  const [hover, setHover] = useState<number | null>(null);
+  const padL = 48;
+  const padR = 8;
+  const padT = 8;
+  const padB = 22;
+  const w = Math.max(width, 200);
+  const iw = w - padL - padR;
+  const ih = height - padT - padB;
+  const n = data.length || 1;
+  const bw = iw / n;
+  const max = niceMax(Math.max(0, ...data.map((d) => d.cost_usd)));
+  const y = (v: number) => padT + ih - (v / max) * ih;
+  const ticks = [0, max / 2, max];
+  const labelEvery = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(iw / 60))));
+  const gap = bw > 6 ? 2 : bw > 3 ? 1 : 0;
+  const onMove = (e: MouseEvent<SVGSVGElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const i = Math.floor((e.clientX - r.left - padL) / bw);
+    setHover(i >= 0 && i < data.length ? i : null);
+  };
+  const hd = hover != null ? data[hover] : null;
+  const tipLeft = hover != null ? Math.min(Math.max(padL + hover * bw + bw / 2 - 80, 0), w - 170) : 0;
+  return (
+    <div className="cost-chart" ref={ref} style={{ height }}>
+      {width > 0 && (
+        <svg width={w} height={height} role="img" aria-label={label} onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+          {ticks.map((tv, i) => (
+            <g key={i}>
+              <line className="grid" x1={padL} x2={w - padR} y1={y(tv)} y2={y(tv)} strokeDasharray={i === 0 ? undefined : "2 3"} />
+              <text x={padL - 6} y={y(tv) + 4} textAnchor="end">
+                {tv === 0 ? "$0" : fmtUsd(tv)}
+              </text>
+            </g>
+          ))}
+          {data.map((d, i) =>
+            i % labelEvery === 0 ? (
+              <text key={`l${d.day}`} x={padL + i * bw + bw / 2} y={height - 6} textAnchor="middle">
+                {d.day.slice(8, 10)}/{d.day.slice(5, 7)}
+              </text>
+            ) : null,
+          )}
+          {data.map((d, i) =>
+            d.cost_usd > 0 ? (
+              <rect key={d.day} className={`bar ${hover === i ? "hover" : ""}`} x={padL + i * bw + gap / 2} width={Math.max(1, bw - gap)} y={y(d.cost_usd)} height={Math.max(1, padT + ih - y(d.cost_usd))} rx={bw > 8 ? 3 : 1} />
+            ) : null,
+          )}
+        </svg>
+      )}
+      {hd && (
+        <div className="chart-tip" style={{ left: tipLeft, top: 0 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>{hd.day}</div>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <span className="faint">{t("keys.colCost")}</span>
+            <span>{fmtUsd(hd.cost_usd)}</span>
+          </div>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <span className="faint">{t("keys.colReq")}</span>
+            <span>{fmtNum(hd.requests)}</span>
+          </div>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <span className="faint">{t("keys.colTokIn")} / {t("keys.colTokOut")}</span>
+            <span>
+              {fmtNum(hd.input_tokens)} / {fmtNum(hd.output_tokens)}
+            </span>
           </div>
         </div>
       )}

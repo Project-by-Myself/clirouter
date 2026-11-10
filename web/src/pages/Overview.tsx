@@ -9,7 +9,7 @@ import type { Key } from "../dict";
 import { useConfig, useStatus } from "../store";
 import type { Bucket } from "../types";
 import { Badge, Empty, ErrorNote } from "../ui";
-import { fmtMs, fmtNum, fmtPct } from "../util";
+import { fmtMs, fmtNum, fmtPct, fmtUsd } from "../util";
 
 const RANGES = ["1h", "6h", "24h", "7d", "30d"] as const;
 type Range = (typeof RANGES)[number];
@@ -151,6 +151,7 @@ export default function Overview() {
       </div>
 
       <div className="mini-stats">
+        <MiniStat icon="bolt" label={`${t("ov.cost")} · ${range}`} value={tot ? fmtUsd(tot.cost_usd) : "–"} />
         <MiniStat icon="play" label={t("ov.inflight")} value={m ? m.inflight : "–"} />
         <MiniStat icon="providers" label={t("nav.providers")} value={status ? t("ov.providersAccounts", { p: status.providers, a: status.accounts }) : "–"} />
         <MiniStat
@@ -278,28 +279,29 @@ function TopTable({ title, rows }: { title: string; rows?: Bucket[] }) {
               <th>{t("common.name")}</th>
               <th className="r">{t("ov.requests")}</th>
               <th className="r">{t("ov.errors")}</th>
-              <th className="r hide-sm">{t("ov.avgTtfb")}</th>
+              <th className="r hide-md">{t("ov.avgTtfb")}</th>
               <th className="r">{t("ov.tokInOut")}</th>
+              <th className="r">{t("ov.costCol")}</th>
             </tr>
           </thead>
           <tbody>
             {!rows && (
               <tr>
-                <td colSpan={5}>
+                <td colSpan={6}>
                   <span className="skeleton">loading</span>
                 </td>
               </tr>
             )}
             {rows && rows.length === 0 && (
               <tr>
-                <td colSpan={5} className="faint">
+                <td colSpan={6} className="faint">
                   {t("ov.noData")}
                 </td>
               </tr>
             )}
             {rows?.slice(0, 12).map((r) => (
               <tr key={r.key}>
-                <td className="bar-cell mono" style={{ maxWidth: 260 }}>
+                <td className="bar-cell mono" style={{ maxWidth: 200 }}>
                   <div className="bar" style={{ width: `${(r.requests / max) * 100}%` }} />
                   <span className="ellipsis" style={{ display: "block" }} title={r.key}>
                     {r.key || "—"}
@@ -307,10 +309,11 @@ function TopTable({ title, rows }: { title: string; rows?: Bucket[] }) {
                 </td>
                 <td className="r">{fmtNum(r.requests)}</td>
                 <td className="r">{r.errors > 0 ? <Badge tone="err" icon="alert">{fmtNum(r.errors)}</Badge> : <span className="faint">0</span>}</td>
-                <td className="r hide-sm">{fmtMs(r.avg_ttfb_ms)}</td>
+                <td className="r hide-md">{fmtMs(r.avg_ttfb_ms)}</td>
                 <td className="r nowrap">
                   {fmtNum(r.input_tokens)} / {fmtNum(r.output_tokens)}
                 </td>
+                <td className="r nowrap">{r.cost_usd ? fmtUsd(r.cost_usd) : <span className="faint">–</span>}</td>
               </tr>
             ))}
           </tbody>

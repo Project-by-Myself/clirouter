@@ -46,9 +46,12 @@ export default function Integrations() {
   useEffect(() => setVisited("1"), [setVisited]);
 
   const listen = status?.listen || config?.listen || "";
+  const publicURL = (config?.public_url || "").trim().replace(/\/+$/, "");
   useEffect(() => {
-    if (listen && !host) setHost(resolveHost(listen));
-  }, [listen, host]);
+    if (host) return;
+    if (publicURL) setHost(publicURL);
+    else if (listen) setHost(resolveHost(listen));
+  }, [listen, host, publicURL]);
 
   useEffect(() => {
     if (!model && models.length) {
@@ -68,7 +71,9 @@ export default function Integrations() {
     return { key: first.key, note: "", real: true };
   }, [pastedKey, first, authRequired, t, os]);
 
-  const base = `http://${host || "127.0.0.1:8317"}`;
+  // The host field accepts "host:port" or a full URL (public_url may be https).
+  const hostVal = host.trim().replace(/\/+$/, "");
+  const base = /^https?:\/\//.test(hostVal) ? hostVal : `http://${hostVal || "127.0.0.1:8317"}`;
   const key = keyInfo.key;
   const m = model || "<model>";
   const fm = fast || m;

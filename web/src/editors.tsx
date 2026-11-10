@@ -2,8 +2,9 @@ import { useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useT } from "./i18n";
 import { Icon } from "./icons";
 
-export function ChipsInput({ values, onChange, placeholder, id, describedBy, mono = true }: { values: string[]; onChange: (v: string[]) => void; placeholder?: string; id?: string; describedBy?: string; mono?: boolean }) {
+export function ChipsInput({ values, onChange, placeholder, id, describedBy, mono = true, suggestions }: { values: string[]; onChange: (v: string[]) => void; placeholder?: string; id?: string; describedBy?: string; mono?: boolean; suggestions?: string[] }) {
   const t = useT();
+  const listId = useId();
   const [text, setText] = useState("");
   const add = (raw: string) => {
     const parts = raw
@@ -51,7 +52,19 @@ export function ChipsInput({ values, onChange, placeholder, id, describedBy, mon
         }}
         onKeyDown={onKey}
         onBlur={() => text.trim() && add(text)}
+        list={suggestions?.length ? listId : undefined}
+        autoComplete="off"
       />
+      {suggestions && suggestions.length > 0 && (
+        <datalist id={listId}>
+          {suggestions
+            .filter((x) => !values.includes(x))
+            .slice(0, 200)
+            .map((x) => (
+              <option key={x} value={x} />
+            ))}
+        </datalist>
+      )}
     </div>
   );
 }

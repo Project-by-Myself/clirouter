@@ -5,7 +5,7 @@ import type { Key } from "./dict";
 import { useStored } from "./hooks";
 import { useI18n } from "./i18n";
 import { Icon, type IconName } from "./icons";
-import { ConfigProvider, StatusProvider, useStatus } from "./store";
+import { ConfigProvider, StatusProvider, useConfig, useStatus } from "./store";
 import { ConfirmProvider, CopyButton, ErrorBoundary, ToastProvider } from "./ui";
 import { endpointURL, fmtUptime } from "./util";
 import Overview from "./pages/Overview";
@@ -17,8 +17,10 @@ const Requests = lazy(() => import("./pages/Requests"));
 const Integrations = lazy(() => import("./pages/Integrations"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Playground = lazy(() => import("./pages/Playground"));
+const Keys = lazy(() => import("./pages/Keys"));
+const MePage = lazy(() => import("./pages/Me"));
 
-// Order defines the 1–8 keyboard shortcuts; groups are visual only.
+// Order defines the 1–9 keyboard shortcuts; groups are visual only.
 const NAV: { to: string; key: Key; icon: IconName; group: Key }[] = [
   { to: "/", key: "nav.overview", icon: "overview", group: "navg.monitor" },
   { to: "/requests", key: "nav.requests", icon: "requests", group: "navg.monitor" },
@@ -26,6 +28,7 @@ const NAV: { to: string; key: Key; icon: IconName; group: Key }[] = [
   { to: "/accounts", key: "nav.accounts", icon: "accounts", group: "navg.routing" },
   { to: "/combos", key: "nav.combos", icon: "combos", group: "navg.routing" },
   { to: "/integrations", key: "nav.integrations", icon: "integrations", group: "navg.connect" },
+  { to: "/keys", key: "nav.keys", icon: "key", group: "navg.connect" },
   { to: "/playground", key: "nav.playground", icon: "playground", group: "navg.connect" },
   { to: "/settings", key: "nav.settings", icon: "settings", group: "navg.system" },
 ];
@@ -56,7 +59,17 @@ function isTyping(e: KeyboardEvent): boolean {
 export default function App() {
   const [auth, setAuth] = useState<AuthState>(getAuthState());
   const [gen, setGen] = useState(0);
+  const loc = useLocation();
   useEffect(() => onAuthState(setAuth), []);
+  // The self-service usage page authenticates with a client key, never the
+  // admin password, so it renders outside the admin shell (no admin polling).
+  if (loc.pathname === "/me" || loc.pathname.startsWith("/me/")) {
+    return (
+      <Suspense fallback={null}>
+        <MePage />
+      </Suspense>
+    );
+  }
   return (
     <ToastProvider>
       <ConfirmProvider>
@@ -130,7 +143,7 @@ function Shell() {
         <div className="sidebar-foot">
           <EndpointCard />
           <div className="kbd-hint hide-sm">
-            <kbd>1</kbd>–<kbd>8</kbd> {t("shell.kbdNav")} · <kbd>t</kbd> {t("shell.kbdTheme")} · <kbd>l</kbd> {t("shell.kbdLang")}
+            <kbd>1</kbd>–<kbd>9</kbd> {t("shell.kbdNav")} · <kbd>t</kbd> {t("shell.kbdTheme")} · <kbd>l</kbd> {t("shell.kbdLang")}
           </div>
         </div>
       </aside>
@@ -164,6 +177,7 @@ function Shell() {
                 <Route path="/combos" element={<Combos />} />
                 <Route path="/requests" element={<Requests />} />
                 <Route path="/integrations" element={<Integrations />} />
+                <Route path="/keys" element={<Keys />} />
                 <Route path="/settings" element={<Settings />} />
                 <Route path="/playground" element={<Playground />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
@@ -179,8 +193,9 @@ function Shell() {
 function EndpointCard() {
   const { t } = useI18n();
   const { status } = useStatus();
+  const { config } = useConfig();
   if (!status) return null;
-  const url = endpointURL(status.listen);
+  const url = config?.public_url || endpointURL(status.listen);
   return (
     <div className="endpoint-card">
       <div className="ep-label">

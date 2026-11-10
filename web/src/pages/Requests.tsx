@@ -6,7 +6,7 @@ import { Icon } from "../icons";
 import { useConfig } from "../store";
 import type { RecordT } from "../types";
 import { Badge, Drawer, Empty, ErrorNote, StatusCode } from "../ui";
-import { fmtDateTime, fmtMs, fmtNum, fmtTime, isErrStatus } from "../util";
+import { fmtDateTime, fmtMs, fmtNum, fmtTime, fmtUsdFine, isErrStatus } from "../util";
 
 type Tab = "live" | "history";
 const rkey = (r: RecordT) => `${r.ts}|${r.id}`;
@@ -168,6 +168,7 @@ function RecordTable({ rows, onSelect, selected, empty }: { rows?: RecordT[]; on
             <th className="r">TTFB</th>
             <th className="r hide-sm">{t("req.duration")}</th>
             <th className="r">{t("req.tokens")}</th>
+            <th className="r hide-sm">{t("req.cost")}</th>
             <th className="r hide-sm" title={t("req.attempts")}>
               #
             </th>
@@ -219,6 +220,7 @@ function RecordTable({ rows, onSelect, selected, empty }: { rows?: RecordT[]; on
                   {fmtNum(r.input_tokens)} / {fmtNum(r.output_tokens)}
                   {r.cache_read_tokens > 0 && <div className="faint">cache {fmtNum(r.cache_read_tokens)}</div>}
                 </td>
+                <td className="r nowrap num small hide-sm">{fmtUsdFine(r.cost_usd)}</td>
                 <td className="r hide-sm">{r.attempts > 1 ? <Badge tone="warn">{r.attempts}</Badge> : <span className="faint">{r.attempts || 1}</span>}</td>
                 <td className="hide-sm">
                   {r.passthrough && (
@@ -258,6 +260,7 @@ function Detail({ r, onClose }: { r: RecordT; onClose: () => void }) {
     ["Cache read", fmtNum(r.cache_read_tokens)],
     ["Cache write", fmtNum(r.cache_write_tokens)],
     ["Reasoning", fmtNum(r.reasoning_tokens)],
+    [t("req.costEst"), fmtUsdFine(r.cost_usd)],
   ];
   return (
     <Drawer open onClose={onClose} title={t("req.detail")} width={520}>

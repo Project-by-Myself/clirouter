@@ -126,7 +126,25 @@ export function diffConfig(a: Config, b: Config, t: TFn): string[] {
   for (const k of Object.keys(a.aliases)) if (!(k in b.aliases)) out.push(`− alias ${k}`);
 
   if (a.listen !== b.listen) out.push(`~ listen ${a.listen} → ${b.listen}`);
-  if (!eq(a.api_keys, b.api_keys)) out.push(`~ api_keys (${a.api_keys.length} → ${b.api_keys.length})`);
+  if ((a.public_url || "") !== (b.public_url || "")) out.push(`~ public_url ${b.public_url || "–"}`);
+  const ak = new Map(a.api_keys.map((k) => [k.name, k]));
+  const bk = new Map(b.api_keys.map((k) => [k.name, k]));
+  for (const [n, k] of bk) {
+    const old = ak.get(n);
+    if (!old) out.push(`+ ${t("diff.key")} ${n}`);
+    else if (!eq(old, k)) {
+      const fields = (Object.keys(k) as (keyof typeof k)[]).filter((f) => !eq(old[f], k[f]));
+      out.push(`~ ${t("diff.key")} ${n}: ${fields.join(", ")}`);
+    }
+  }
+  for (const n of ak.keys()) if (!bk.has(n)) out.push(`− ${t("diff.key")} ${n}`);
+  const apr = a.pricing || {};
+  const bp2 = b.pricing || {};
+  for (const m of new Set([...Object.keys(apr), ...Object.keys(bp2)])) {
+    if (!(m in bp2)) out.push(`− ${t("diff.price")} ${m}`);
+    else if (!(m in apr)) out.push(`+ ${t("diff.price")} ${m}`);
+    else if (!eq(apr[m], bp2[m])) out.push(`~ ${t("diff.price")} ${m}`);
+  }
   if ((a.admin_password || "") !== (b.admin_password || "")) out.push(`~ admin_password`);
   for (const sec of ["timeouts", "routing", "logging"] as const) {
     const x = a[sec] as unknown as Record<string, unknown>;

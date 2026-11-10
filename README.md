@@ -26,6 +26,19 @@ formats on the fly. It ships as one Go binary (~13 MB, ~25 MB RAM) with an embed
   account.
 - **Multi-key rotation.** Round-robin, fill-first or least-busy across keys, plus session
   affinity so prompt caches keep hitting.
+- **Keys for your users, with limits.** Give each person or machine its own client key with
+  allowed models, a USD or token budget (daily, weekly, monthly or total), requests per minute,
+  max concurrent requests and an expiry date. Disable or rotate a key without affecting anyone
+  else. The dashboard writes a ready-to-send message with the endpoint, key and setup steps.
+- **Usage and cost tracking.** Every request is priced from a built-in list-price table, which
+  you can override per model or zero per provider for flat-rate plans. Totals roll up per key,
+  model and provider. Daily usage is kept independently of the request-log retention.
+- **Upstream quota tracker.** clirouter reads rate-limit and subscription-window headers
+  (Anthropic, OpenAI, Codex 5h/weekly, Claude 5h/7d) and shows the remaining quota and reset
+  time per account. Per-provider spend caps make the router skip a provider once its budget is
+  used and fall back to the next target.
+- **Self-service usage.** Key holders can check their own limits and spend at `/me` or via
+  `GET /v1/key/info`.
 - **Combos and aliases.** Build one model name out of several targets (`fallback` or
   `round-robin`), and remap the model names your tools hard-code.
 - **Dashboard.** Live request tail, latency and token charts, per-account health,
@@ -142,6 +155,25 @@ claude
 > Setting all three `ANTHROPIC_DEFAULT_*_MODEL` variables makes `/model`, subagents and
 > background tasks go through clirouter too, not just the main model.
 
+## Give someone access
+
+1. Make clirouter reachable from their machine. Bind to a LAN, VPN or Tailscale address
+   (`listen: 0.0.0.0:8317`, which forces an admin password), or put it behind a TLS reverse
+   proxy. Then set **Settings → Public URL** to the address they will use.
+2. Open **Keys & usage → Create key**. Pick a name, the allowed models, a budget and period,
+   an RPM or concurrency limit, and an expiry date.
+3. The key is shown **once**, together with a ready-to-send message: the endpoint, the key,
+   their limits, Claude Code setup for macOS/Linux and Windows, and a link to the `/me` usage
+   page. Copy it and send it.
+4. Watch their usage and estimated cost on the same page. **Disable**, **Rotate** or **Delete**
+   the key at any time; changes apply to the next request.
+
+Their own view: `http://<public-url>/me`, or
+
+```bash
+curl -H "Authorization: Bearer $KEY" http://<public-url>/v1/key/info
+```
+
 ## Configuration
 
 Everything lives in `~/.clirouter/config.yaml`. The dashboard edits the same file. Values written
@@ -150,9 +182,22 @@ Everything lives in `~/.clirouter/config.yaml`. The dashboard edits the same fil
 ```yaml
 listen: 127.0.0.1:8317
 
+public_url: http://100.64.0.10:8317   # optional: how other machines reach you (used in share messages)
+
 api_keys:                       # client keys; empty = only this machine may call the API
   - name: laptop
     key: sha256:9f86d0…          # stored hashed when created from the dashboard
+  - name: alice
+    key: sha256:4be1c2…
+    note: "Alice – contractor"
+    models: [coding, "claude-sonnet-*"]   # allowed model names ("*" suffix = prefix); empty = all
+    budget_usd: 20                        # estimated spend cap per period
+    budget_tokens: 0                      # input+output token cap per period (0 = none)
+    budget_period: monthly                # daily | weekly | monthly | total
+    rpm: 60                               # requests per minute
+    max_parallel: 4                       # concurrent requests
+    expires_at: 2026-12-31T23:59:59+07:00
+    disabled: false
 
 providers:
   - id: anthropic
@@ -165,6 +210,8 @@ providers:
     models: [z-ai/glm-4.6]
     model_map: { glm: z-ai/glm-4.6 }   # client name → upstream name
     priority: 1                         # lower is tried first
+    budget_usd: 10                      # skip this provider once $10 is spent…
+    budget_period: monthly              # …this month (falls back to the next target)
 
 combos:
   - name: coding
@@ -192,7 +239,28 @@ logging:
   level: info
   retention_days: 14
   capture_bodies: false     # store bodies of failed requests for debugging
+
+pricing:                    # USD per 1M tokens; overrides the built-in list prices
+  claude-sonnet-4-5: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }
+  openrouter/z-ai/glm-4.6: { input: 0.6, output: 2.2 }
+  minimax/*: { input: 0, output: 0 }     # flat-rate plan: count tokens, no cost
 ```
+
+**Client key limits.** When a key breaks a rule, the request never reaches a provider, and the
+client receives an error in its own API format:
+
+| Situation | Status | Error type |
+|---|---|---|
+| Key disabled or expired | 401 | `authentication_error` |
+| Model not in the key's `models` | 403 | `permission_error` |
+| Budget for the period reached | 402 | `billing_error` |
+| `rpm` or `max_parallel` exceeded | 429 + `Retry-After` | `rate_limit_error` |
+| Every provider for the model over its budget | 402 | `billing_error` |
+
+Budgets use **estimated** cost. Prices come from the built-in table, can be overridden under
+`pricing:`, and are listed under **Settings → Pricing**. Unknown models count tokens but cost $0.
+Periods follow the server's local calendar, with weeks starting on Monday. Usage is tracked by
+key **name**, so renaming a key starts its counters from zero.
 
 **Provider types**
 
@@ -226,6 +294,7 @@ logged.
 | `POST` | `/v1/responses` (also `/responses`) | OpenAI Responses |
 | `POST` | `/v1beta/models/{model}:generateContent` · `:streamGenerateContent` | Gemini |
 | `GET` | `/v1/models`, `/v1beta/models` | Models, combos and aliases you can call |
+| `GET` | `/v1/key/info` | The calling key's limits and current usage (self-service) |
 | `GET` | `/healthz` | Liveness, no auth |
 | `GET` | `/metrics` | Prometheus metrics (client key) |
 
@@ -235,12 +304,16 @@ logged.
 |---|---|---|
 | `GET` | `/admin/api/status` | Version, uptime, listen address, live metrics, account counts |
 | `GET` · `PUT` | `/admin/api/config` | Read (secrets masked) / replace the whole config; validated, written atomically, hot-reloaded |
-| `GET` | `/admin/api/accounts` | Per key/account health, cooldowns, last error |
+| `GET` | `/admin/api/accounts` | Per key/account health, cooldowns, last error, upstream quota windows |
 | `POST` | `/admin/api/accounts/{id}/reset` | Clear an account's cooldown and error state |
 | `GET` | `/admin/api/requests?limit&before&provider&model&errors` | Request history (paged) |
 | `GET` | `/admin/api/live?n=100` | Most recent requests, including in-flight |
 | `GET` | `/admin/api/stats?range=1h\|6h\|24h\|7d\|30d` | Totals, timeline, and breakdowns by model/provider/key |
 | `GET` | `/admin/api/models` | Routable model ids with their owner |
+| `GET` | `/admin/api/keys/usage` | Per client key: status, current-period and today's usage, in-flight, RPM |
+| `GET` | `/admin/api/providers/usage` | Per provider: current-period spend, over-budget flag |
+| `GET` | `/admin/api/usage?range=7d\|30d\|90d&group=key\|model\|provider[&key=]` | Usage and estimated cost from the daily rollup, with a per-day series |
+| `GET` | `/admin/api/pricing` | Built-in list prices and configured overrides |
 | `POST` | `/admin/api/oauth/start` · `/complete` | Start/finish an OAuth login (redirect, paste-code or device flow) |
 | `GET` | `/admin/api/oauth/status?flow_id=` | Poll a login flow |
 | `GET` · `DELETE` | `/admin/api/oauth/accounts[/{id}]` | List / remove stored OAuth accounts |
@@ -251,12 +324,16 @@ Screenshots use a demo config: a local mock provider and fake keys.
 
 | | |
 |---|---|
+| ![Keys & usage](docs/images/keys.png) | ![Share access](docs/images/share.png) |
+| **Keys & usage**: client keys with allowed models, budgets, rate limits and expiry; spend per key/model/provider and daily cost. | **Share**: a ready-to-send message with endpoint, key, limits and Claude Code setup for macOS/Linux and Windows. |
 | ![Providers](docs/images/providers.png) | ![Accounts](docs/images/accounts.png) |
-| **Providers**: type, endpoint, key count, models, priority; toggle live. | **Accounts**: per-key health, per-model cooldowns, OK/fail counts, last error, OAuth logins. |
+| **Providers**: type, endpoint, key count, models, priority, spend vs. budget; toggle live. | **Accounts**: per-key health, upstream quota windows with reset times, cooldowns, last error. |
 | ![Combos & aliases](docs/images/combos.png) | ![Requests](docs/images/requests.png) |
 | **Combos & aliases**: one model name over several targets (fallback / round-robin). | **Requests**: live tail and history with model → provider/upstream, TTFB, tokens, attempts. |
-| ![Integrations](docs/images/integrations.png) | ![Dark theme](docs/images/overview-dark.png) |
-| **Integrations**: copy-paste setup for each tool on macOS/Linux and Windows, with a connection test. | Dark theme, English / Vietnamese. Keys: `1`–`8` pages, `t` theme, `l` language. |
+| ![Integrations](docs/images/integrations.png) | ![Usage page for key holders](docs/images/me.png) |
+| **Integrations**: copy-paste setup for each tool on macOS/Linux and Windows, with a connection test. | **`/me`**: key holders check their own usage, limits and endpoints, with no admin access needed. |
+| ![Dark theme](docs/images/overview-dark.png) | |
+| Dark theme, English / Vietnamese. Keys: `1`–`9` pages, `t` theme, `l` language. | |
 
 ## Built for stability and speed
 

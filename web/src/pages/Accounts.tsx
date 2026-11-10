@@ -4,7 +4,7 @@ import { api } from "../api";
 import { useNow, usePoll } from "../hooks";
 import { useT } from "../i18n";
 import { Icon } from "../icons";
-import type { AccountStatus } from "../types";
+import type { AccountStatus, QuotaWindow } from "../types";
 import { Badge, Empty, ErrorNote, useConfirm, useToast } from "../ui";
 import OAuthAccounts from "./OAuthAccounts";
 import { fmtAgo, fmtCountdown, fmtDateTime, fmtNum, fmtTime } from "../util";
@@ -102,7 +102,9 @@ export default function Accounts() {
         </div>
       )}
       <div className="stack">
-        {groups.map(([prov, accs]) => (
+        {groups.map(([prov, accs]) => {
+          const hasQ = accs.some((a) => a.quota && a.quota.length > 0);
+          return (
           <div className="card" key={prov}>
             <div className="card-head">
               <h2 className="mono">{prov}</h2>
@@ -116,6 +118,7 @@ export default function Accounts() {
                   <tr>
                     <th>{t("acc.account")}</th>
                     <th>{t("acc.health")}</th>
+                    {hasQ && <th>{t("acc.quota")}</th>}
                     <th className="r">{t("acc.inflight")}</th>
                     <th className="r">{t("acc.okFail")}</th>
                     <th className="hide-sm">{t("acc.lastUsed")}</th>
@@ -171,6 +174,11 @@ export default function Accounts() {
                               ))}
                             </div>
                           </td>
+                          {hasQ && (
+                            <td title={a.quota_at ? t("acc.quotaUpdated", { t: fmtAgo(a.quota_at, now) }) : undefined}>
+                              {a.quota && a.quota.length ? <QuotaList q={a.quota} now={now} /> : <span className="faint">–</span>}
+                            </td>
+                          )}
                           <td className="r">{a.inflight}</td>
                           <td className="r nowrap">
                             <span style={{ color: "var(--ok)" }}>{fmtNum(a.successes)}</span>
@@ -198,7 +206,7 @@ export default function Accounts() {
                         </tr>
                         {isOpen && a.last_error && (
                           <tr>
-                            <td colSpan={7} style={{ background: "var(--surface-2)" }}>
+                            <td colSpan={hasQ ? 8 : 7} style={{ background: "var(--surface-2)" }}>
                               <div className="faint small" style={{ marginBottom: 4 }}>
                                 {a.last_error_at && fmtDateTime(a.last_error_at)}
                               </div>
@@ -215,11 +223,43 @@ export default function Accounts() {
               </table>
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
       <div style={{ marginTop: 20 }}>
         <OAuthAccounts />
       </div>
+    </div>
+  );
+}
+
+/** Upstream quota windows parsed from rate-limit headers (requests/tokens, 5h/7d subscription windows). */
+function QuotaList({ q, now }: { q: QuotaWindow[]; now: number }) {
+  const t = useT();
+  return (
+    <div className="quota-list">
+      {q.map((w) => {
+        const pct = w.used_pct ?? (w.limit && w.remaining !== undefined ? ((w.limit - w.remaining) / w.limit) * 100 : undefined);
+        const left = w.resets_at ? new Date(w.resets_at).getTime() - now : 0;
+        const tone = pct === undefined ? "" : pct >= 100 ? "err" : pct >= 80 ? "warn" : "ok";
+        return (
+          <div className="quota-item" key={w.name}>
+            <div className="q-head">
+              <span className="q-name">{w.name}</span>
+              <span>
+                {pct !== undefined ? `${Math.round(pct)}%` : ""}
+                {w.remaining !== undefined && w.limit ? ` · ${t("acc.left", { n: fmtNum(w.remaining) })}` : ""}
+              </span>
+            </div>
+            {pct !== undefined && (
+              <div className={`meter ${tone}`} role="progressbar" aria-label={w.name} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(pct)}>
+                <i style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
+              </div>
+            )}
+            {left > 0 && <div className="q-reset small">{t("acc.resetsIn", { t: fmtCountdown(left) })}</div>}
+          </div>
+        );
+      })}
     </div>
   );
 }

@@ -176,3 +176,50 @@ export function resolveHost(listen: string): string {
 export function endpointURL(listen: string): string {
   return `http://${resolveHost(listen)}`;
 }
+
+/** Estimated USD cost: "<$0.01", "$4.20", "$1.2k". */
+export function fmtUsd(v: number | undefined | null): string {
+  const n = v || 0;
+  if (n === 0) return "$0";
+  if (n < 0.01) return "<$0.01";
+  if (n >= 10000) return `$${(n / 1000).toFixed(0)}k`;
+  if (n >= 1000) return `$${(n / 1000).toFixed(1)}k`;
+  return `$${n.toFixed(2)}`;
+}
+
+/** Per-request cost with more precision ("$0.0123"); "—" when zero/unknown. */
+export function fmtUsdFine(v: number | undefined | null): string {
+  const n = v || 0;
+  if (n <= 0) return "—";
+  if (n < 0.0001) return "<$0.0001";
+  if (n < 1) return `$${n.toFixed(4)}`;
+  return `$${n.toFixed(2)}`;
+}
+
+export function isLoopbackListen(listen: string): boolean {
+  const h = resolveHost(listen).replace(/:\d+$/, "").replace(/^\[|\]$/g, "");
+  return h === "localhost" || h === "::1" || h.startsWith("127.");
+}
+
+/** Base URL users should be given: public_url if set, else derived from listen. */
+export function publicBase(publicURL: string | undefined, listen: string): string {
+  const p = (publicURL || "").trim().replace(/\/+$/, "");
+  return p || endpointURL(listen);
+}
+
+/** RFC3339 end-of-day (local time) for a yyyy-mm-dd date input; "" for empty. */
+export function endOfDayISO(date: string): string {
+  if (!date) return "";
+  const d = new Date(`${date}T23:59:59`);
+  if (isNaN(d.getTime())) return "";
+  return d.toISOString();
+}
+
+/** yyyy-mm-dd (local) for a date input from an RFC3339 timestamp. */
+export function toDateInput(ts: string | undefined): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return "";
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}

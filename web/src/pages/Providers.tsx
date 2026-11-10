@@ -1,12 +1,15 @@
 import { useMemo, useState } from "react";
+import { api } from "../api";
+import type { Key } from "../dict";
+import { usePoll } from "../hooks";
 import { ChipsInput, fromRows, KVEditor, rowsError, toRows, type KVRows } from "../editors";
 import { useT, type TFn } from "../i18n";
 import { Icon } from "../icons";
 import { useConfig } from "../store";
-import { OAUTH_TYPE_MAP, OAUTH_TYPES, PROVIDER_TYPES, type Config, type Provider } from "../types";
+import { BUDGET_PERIODS, OAUTH_TYPE_MAP, OAUTH_TYPES, PROVIDER_TYPES, type BudgetPeriod, type Config, type Provider, type ProviderUsage } from "../types";
 import { OAUTH_LABEL, OAuthFlow } from "../oauth";
-import { Badge, Drawer, Empty, ErrorNote, Field, Switch, useConfirm, useToast } from "../ui";
-import { clone, fmtDuration, isMasked, maskHint, parseDuration } from "../util";
+import { Badge, Drawer, Empty, ErrorNote, Field, Meter, Switch, useConfirm, useToast } from "../ui";
+import { clone, fmtDuration, fmtUsd, isMasked, maskHint, parseDuration } from "../util";
 
 interface Form {
   origId: string | null;
@@ -24,6 +27,8 @@ interface Form {
   disabled: boolean;
   first_byte: string;
   idle: string;
+  budget_usd: string;
+  budget_period: BudgetPeriod;
 }
 
 function toForm(p: Provider | null): Form {
@@ -43,6 +48,8 @@ function toForm(p: Provider | null): Form {
     disabled: !!p?.disabled,
     first_byte: p ? fmtDuration(p.first_byte) : "",
     idle: p ? fmtDuration(p.idle) : "",
+    budget_usd: p?.budget_usd ? String(p.budget_usd) : "",
+    budget_period: p?.budget_period || "monthly",
   };
 }
 
@@ -59,7 +66,7 @@ function mergeKeys(keys: string[], extra: string): string[] {
   return out;
 }
 
-type Errors = Partial<Record<"id" | "type" | "base_url" | "first_byte" | "idle" | "priority" | "model_map" | "headers" | "keys", string>>;
+type Errors = Partial<Record<"id" | "type" | "base_url" | "first_byte" | "idle" | "priority" | "model_map" | "headers" | "keys" | "budget_usd", string>>;
 
 function validate(f: Form, cfg: Config, t: TFn): Errors {
   const e: Errors = {};
@@ -74,6 +81,7 @@ function validate(f: Form, cfg: Config, t: TFn): Errors {
   if (parseDuration(f.first_byte) === null) e.first_byte = t("val.duration");
   if (parseDuration(f.idle) === null) e.idle = t("val.duration");
   if (f.priority.trim() && !/^-?\d+$/.test(f.priority.trim())) e.priority = t("val.int");
+  if (f.budget_usd.trim() && !(Number.isFinite(Number(f.budget_usd)) && Number(f.budget_usd) >= 0)) e.budget_usd = t("val.nonNeg");
   const mm = rowsError(f.model_map, t);
   if (mm) e.model_map = mm;
   const hh = rowsError(f.headers, t);
@@ -97,6 +105,8 @@ function fromForm(f: Form, base: Provider | null): Provider {
     disabled: f.disabled,
     first_byte: parseDuration(f.first_byte) || 0,
     idle: parseDuration(f.idle) || 0,
+    budget_usd: f.budget_usd.trim() ? Number(f.budget_usd) : 0,
+    budget_period: f.budget_period,
   };
 }
 
@@ -106,6 +116,8 @@ export default function Providers() {
   const { config, error, loading, save } = useConfig();
   const [editing, setEditing] = useState<Form | null>(null);
   const [q, setQ] = useState("");
+  const spend = usePoll((s) => api.providersUsage(s), 10000);
+  const spendBy = useMemo(() => new Map((spend.data || []).map((u) => [u.id, u])), [spend.data]);
 
   const list = useMemo(() => {
     const ps = config?.providers || [];
@@ -161,7 +173,7 @@ export default function Providers() {
       ) : (
         <div className="provider-grid">
           {list.map((p) => (
-            <ProviderCard key={p.id} p={p} onEdit={() => setEditing(toForm(p))} onToggle={() => toggle(p)} onDelete={() => remove(p)} />
+            <ProviderCard key={p.id} p={p} usage={spendBy.get(p.id)} onEdit={() => setEditing(toForm(p))} onToggle={() => toggle(p)} onDelete={() => remove(p)} />
           ))}
           {list.length === 0 && <div className="faint">{t("common.noMatch")}</div>}
         </div>
@@ -193,7 +205,7 @@ function ProviderAvatar({ p }: { p: Provider }) {
   );
 }
 
-function ProviderCard({ p, onEdit, onToggle, onDelete }: { p: Provider; onEdit: () => void; onToggle: () => void; onDelete: () => void }) {
+function ProviderCard({ p, usage, onEdit, onToggle, onDelete }: { p: Provider; usage?: ProviderUsage; onEdit: () => void; onToggle: () => void; onDelete: () => void }) {
   const t = useT();
   const shown = p.models.slice(0, 6);
   const mapped = Object.keys(p.model_map);
@@ -208,6 +220,11 @@ function ProviderCard({ p, onEdit, onToggle, onDelete }: { p: Provider; onEdit: 
           <div className="row" style={{ gap: 6, marginTop: 3 }}>
             <Badge tone="accent">{p.type}</Badge>
             {p.disabled && <Badge icon="pause">{t("prov.disabled")}</Badge>}
+            {usage?.over_budget && (
+              <Badge tone="err" icon="alert">
+                {t("prov.overBudget")}
+              </Badge>
+            )}
           </div>
         </div>
         <Switch checked={!p.disabled} onChange={onToggle} label={<span className="sr-only">{t("prov.enableX", { id: p.id })}</span>} />
@@ -246,6 +263,19 @@ function ProviderCard({ p, onEdit, onToggle, onDelete }: { p: Provider; onEdit: 
           <>
             <dt>Proxy</dt>
             <dd className="mono ellipsis">{p.proxy}</dd>
+          </>
+        )}
+        {(p.budget_usd || 0) > 0 && (
+          <>
+            <dt>{t("prov.spend")}</dt>
+            <dd>
+              <Meter
+                pct={usage ? (usage.cost_usd / (p.budget_usd || 1)) * 100 : 0}
+                value={`${fmtUsd(usage?.cost_usd || 0)} / ${fmtUsd(p.budget_usd)}`}
+                sub={t(`keys.per.${p.budget_period || "monthly"}` as Key)}
+                label={t("prov.spend")}
+              />
+            </dd>
           </>
         )}
       </dl>
@@ -429,6 +459,22 @@ function ProviderDrawer({ form, setForm, config, save, onClose }: { form: Form; 
           </Field>
           <Field label="idle" hint={t("prov.overrideHint")} error={show("idle")}>
             {(id, d) => <input id={id} aria-describedby={d} aria-invalid={!!show("idle")} className="input mono" value={form.idle} placeholder={fmtDuration(config.timeouts.idle)} onChange={(e) => set("idle", e.target.value)} />}
+          </Field>
+        </div>
+        <div className="grid-2">
+          <Field label={t("prov.budget")} hint={t("prov.budgetHint")} error={show("budget_usd")}>
+            {(id, d) => <input id={id} aria-describedby={d} aria-invalid={!!show("budget_usd")} className="input num" inputMode="decimal" value={form.budget_usd} placeholder="0" onChange={(e) => set("budget_usd", e.target.value)} />}
+          </Field>
+          <Field label={t("prov.budgetPeriod")}>
+            {(id) => (
+              <select id={id} className="input" value={form.budget_period} onChange={(e) => set("budget_period", e.target.value as BudgetPeriod)}>
+                {BUDGET_PERIODS.map((x) => (
+                  <option key={x} value={x}>
+                    {t(`keys.perL.${x}` as Key)}
+                  </option>
+                ))}
+              </select>
+            )}
           </Field>
         </div>
         <Field label="Proxy" hint={t("prov.proxyHint")}>

@@ -312,3 +312,21 @@ export class ErrorBoundary extends Component<{ children: ReactNode; resetKey?: s
     return this.props.children;
   }
 }
+
+/* ---------- Meter ---------- */
+/** Progress bar with a value line. pct is 0–100; tone escalates at 80% / 100%. */
+export function Meter({ pct, value, sub, label }: { pct: number; value: ReactNode; sub?: ReactNode; label: string }) {
+  const p = Math.max(0, Math.min(100, pct));
+  const tone = pct >= 100 ? "err" : pct >= 80 ? "warn" : "";
+  return (
+    <div className="meter-block">
+      <div className="meter-line">
+        <span className="ml-val">{value}</span>
+        {sub && <span className="ml-sub">{sub}</span>}
+      </div>
+      <div className={`meter ${tone}`} role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(p)}>
+        <i style={{ width: `${p}%` }} />
+      </div>
+    </div>
+  );
+}

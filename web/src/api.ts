@@ -1,4 +1,4 @@
-import type { AccountStatus, Config, ModelInfo, OAuthAccount, OAuthFlowStatus, OAuthStart, Provider, RecordT, Stats, Status } from "./types";
+import type { AccountStatus, ClientKey, Config, KeyUsage, ModelInfo, OAuthAccount, OAuthFlowStatus, OAuthStart, PricingInfo, Provider, ProviderUsage, RecordT, Stats, Status, UsageReport } from "./types";
 
 function normProvider(p: Provider): Provider {
   return {
@@ -14,16 +14,35 @@ function normProvider(p: Provider): Provider {
     disabled: !!p.disabled,
     first_byte: p.first_byte || 0,
     idle: p.idle || 0,
+    budget_usd: p.budget_usd || 0,
+    budget_period: p.budget_period || "monthly",
+  };
+}
+
+function normKey(k: ClientKey): ClientKey {
+  return {
+    ...k,
+    note: k.note || "",
+    models: k.models || [],
+    budget_usd: k.budget_usd || 0,
+    budget_tokens: k.budget_tokens || 0,
+    budget_period: k.budget_period || "monthly",
+    rpm: k.rpm || 0,
+    max_parallel: k.max_parallel || 0,
+    expires_at: k.expires_at || "",
+    disabled: !!k.disabled,
   };
 }
 
 export function normalizeConfig(c: Config): Config {
   return {
     ...c,
-    api_keys: c.api_keys || [],
+    api_keys: (c.api_keys || []).map(normKey),
     providers: (c.providers || []).map(normProvider),
     combos: (c.combos || []).map((x) => ({ ...x, targets: x.targets || [] })),
     aliases: c.aliases || {},
+    public_url: c.public_url || "",
+    pricing: c.pricing || {},
   };
 }
 
@@ -135,6 +154,14 @@ export const api = {
       by_key: x.by_key || [],
       timeline: x.timeline || [],
     })),
+  keysUsage: (s?: AbortSignal) => req<KeyUsage[] | null>("GET", "/admin/api/keys/usage", undefined, s).then((x) => x || []),
+  providersUsage: (s?: AbortSignal) => req<ProviderUsage[] | null>("GET", "/admin/api/providers/usage", undefined, s).then((x) => x || []),
+  usage: (q: { range: string; group: string; key?: string }, s?: AbortSignal) => {
+    const p = new URLSearchParams({ range: q.range, group: q.group });
+    if (q.key) p.set("key", q.key);
+    return req<UsageReport>("GET", `/admin/api/usage?${p}`, undefined, s).then((x) => ({ ...x, rows: x.rows || [], daily: x.daily || [] }));
+  },
+  pricing: (s?: AbortSignal) => req<PricingInfo>("GET", "/admin/api/pricing", undefined, s).then((x) => ({ builtin: x.builtin || {}, overrides: x.overrides || {} })),
   models: (s?: AbortSignal) => req<ModelInfo[]>("GET", "/admin/api/models", undefined, s),
   oauthStart: (b: { type: string; account_id?: string; project_id?: string }) => req<OAuthStart>("POST", "/admin/api/oauth/start", b),
   oauthComplete: (flow_id: string, code: string) => req<OAuthAccount>("POST", "/admin/api/oauth/complete", { flow_id, code }),

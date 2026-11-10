@@ -443,8 +443,8 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 }
 .legend { display: flex; gap: 14px; font-size: 12px; color: var(--text-2); flex-wrap: wrap; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
-.split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-@media (max-width: 1000px) { .split { grid-template-columns: 1fr; } }
+.split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+@media (max-width: 1000px) { .split { grid-template-columns: minmax(0, 1fr); } }
 .detail-grid { display: grid; grid-template-columns: 140px 1fr; gap: 8px 12px; font-size: 13px; }
 .detail-grid dt { color: var(--text-3); }
 .detail-grid dd { margin: 0; word-break: break-all; }
@@ -479,3 +479,55 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .tool .t-name { font-weight: 650; font-size: 13.5px; display: flex; align-items: center; gap: 8px; }
 .tool .t-proto { font-size: 11.5px; color: var(--text-3); font-family: var(--mono); }
 .test-result { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+
+/* Meters (budget / quota) */
+.meter { position: relative; height: 6px; border-radius: 99px; background: var(--surface-3); overflow: hidden; min-width: 80px; }
+.meter > i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 99px; background: var(--accent); transition: width 0.3s; }
+.meter.ok > i { background: var(--ok); }
+.meter.warn > i { background: var(--warn); }
+.meter.err > i { background: var(--err); }
+.meter-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 12px; margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+.meter-line .ml-val { font-weight: 600; color: var(--text); }
+.meter-line .ml-sub { color: var(--text-3); white-space: nowrap; }
+.meter-block + .meter-block { margin-top: 8px; }
+
+/* Keys page */
+.key-name { font-weight: 650; font-family: var(--mono); font-size: 13px; }
+.key-note { font-size: 12px; color: var(--text-3); max-width: 240px; }
+.key-actions { display: flex; align-items: center; gap: 2px; justify-content: flex-end; }
+.usage-cell { min-width: 200px; max-width: 280px; }
+.tbl tr.dim td { opacity: 0.6; }
+.secret-box { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 10px; border: 1px dashed var(--accent-line); background: var(--accent-soft); }
+.secret-box code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; font-size: 13px; color: var(--text); }
+
+/* Cost bar chart */
+.cost-chart { position: relative; }
+.cost-chart svg { display: block; overflow: visible; }
+.cost-chart .bar { fill: var(--series-1); }
+.cost-chart .bar.hover { fill: var(--accent-2); }
+.cost-chart .grid { stroke: var(--grid); }
+.cost-chart text { fill: var(--text-3); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+
+/* Quota (Accounts) */
+.quota-list { display: flex; flex-direction: column; gap: 6px; min-width: 170px; max-width: 240px; }
+.quota-item .q-head { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; margin-bottom: 3px; font-variant-numeric: tabular-nums; }
+.quota-item .q-name { font-weight: 600; color: var(--text-2); font-family: var(--mono); }
+.quota-item .q-reset { color: var(--text-3); white-space: nowrap; }
+
+/* Self-service usage page */
+.me-page { min-height: 100vh; padding: 40px 16px; background: radial-gradient(1200px 600px at 50% -10%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 70%), var(--bg); }
+.me-wrap { max-width: 680px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+.me-head { display: flex; align-items: center; gap: 10px; }
+.me-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 560px) { .me-stats { grid-template-columns: 1fr; } }
+.me-stat { padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
+.me-stat .ms-label { font-size: 12px; color: var(--text-3); }
+.me-stat .ms-value { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.me-stat .ms-sub { font-size: 12px; color: var(--text-3); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.price-tbl input.input { height: 30px; font-size: 12.5px; padding: 0 8px; }
+.price-tbl td { padding: 6px 8px; }
+details.builtin > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--text-2); padding: 4px 0; }
+details.builtin[open] > summary { margin-bottom: 10px; }
+
+/* Columns hidden where two tables share a row */
+@media (max-width: 1700px) { .split .hide-md { display: none; } }

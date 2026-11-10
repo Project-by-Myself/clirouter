@@ -1,18 +1,39 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
+import { api } from "../api";
+import { usePoll } from "../hooks";
 import { setPassword } from "../api";
 import type { Key } from "../dict";
 import { useT, type TFn } from "../i18n";
 import { Icon } from "../icons";
 import { diffConfig, useConfig } from "../store";
-import type { ClientKey, Config, Logging, Routing, Timeouts } from "../types";
-import { Badge, CopyButton, ErrorNote, Field, Switch, useConfirm } from "../ui";
-import { clone, fmtDuration, isMasked, maskHint, parseDuration, randomKey } from "../util";
+import type { Config, Logging, Price, Routing, Timeouts } from "../types";
+import { Badge, ErrorNote, Field, Switch, useConfirm } from "../ui";
+import { clone, fmtDuration, isMasked, maskHint, parseDuration } from "../util";
 
 const TIMEOUTS: (keyof Timeouts)[] = ["connect", "first_byte", "idle", "total", "early_ping", "keepalive"];
 
+interface PriceRow {
+  model: string;
+  input: string;
+  output: string;
+  cache_read: string;
+  cache_write: string;
+}
+
+const PRICE_FIELDS = ["input", "output", "cache_read", "cache_write"] as const;
+
+function toPriceRow(model: string, p: Price): PriceRow {
+  const f = (v?: number) => (v === undefined || v === null ? "" : String(v));
+  return { model, input: f(p.input), output: f(p.output), cache_read: f(p.cache_read), cache_write: f(p.cache_write) };
+}
+
+const priceBad = (v: string) => v.trim() !== "" && !(Number.isFinite(Number(v)) && Number(v) >= 0);
+
 interface Draft {
   listen: string;
-  api_keys: ClientKey[];
+  public_url: string;
+  pricing: PriceRow[];
   admin_password: string;
   timeouts: Record<keyof Timeouts, string>;
   routing: { strategy: string; max_attempts: string; session_affinity: boolean; max_body_mb: string };
@@ -24,7 +45,8 @@ function toDraft(c: Config): Draft {
   for (const k of TIMEOUTS) to[k] = fmtDuration(c.timeouts[k]) || "0s";
   return {
     listen: c.listen,
-    api_keys: clone(c.api_keys),
+    public_url: c.public_url || "",
+    pricing: Object.entries(c.pricing || {}).map(([m, p]) => toPriceRow(m, p)),
     admin_password: c.admin_password || "",
     timeouts: to,
     routing: { strategy: c.routing.strategy, max_attempts: String(c.routing.max_attempts), session_affinity: c.routing.session_affinity, max_body_mb: String(c.routing.max_body_mb) },
@@ -42,23 +64,33 @@ function validate(d: Draft, t: TFn): Record<string, string> {
   if (!intOk(d.routing.max_attempts)) e.max_attempts = t("val.int");
   if (!intOk(d.routing.max_body_mb)) e.max_body_mb = t("val.int");
   if (!intOk(d.logging.retention_days)) e.retention_days = t("val.int");
-  const names = new Set<string>();
-  const keys = new Set<string>();
-  d.api_keys.forEach((k, i) => {
-    if (!k.name.trim()) e[`k.${i}`] = t("set.keyNameReq");
-    else if (names.has(k.name.trim())) e[`k.${i}`] = t("val.kvDup", { k: k.name });
-    else if (!k.key.trim()) e[`k.${i}`] = t("set.keyReq");
-    else if (keys.has(k.key)) e[`k.${i}`] = t("set.keyDup");
-    names.add(k.name.trim());
-    keys.add(k.key);
-  });
+  if (d.public_url.trim() && !/^https?:\/\/[^\s/]+/.test(d.public_url.trim())) e.public_url = t("val.url");
+  const seen = new Set<string>();
+  for (const r of d.pricing) {
+    const m = r.model.trim();
+    if (!m || seen.has(m) || PRICE_FIELDS.some((f) => priceBad(r[f])) || r.input.trim() === "" || r.output.trim() === "") {
+      e.pricing = t("set.priceErr");
+      break;
+    }
+    seen.add(m);
+  }
   return e;
 }
 
 function apply(c: Config, d: Draft): Config {
   const n = clone(c);
   n.listen = d.listen.trim();
-  n.api_keys = d.api_keys.map((k) => ({ name: k.name.trim(), key: k.key.trim() }));
+  n.public_url = d.public_url.trim().replace(/\/+$/, "");
+  const pr: Record<string, Price> = {};
+  for (const r of d.pricing) {
+    const m = r.model.trim();
+    if (!m) continue;
+    const p: Price = { input: Number(r.input) || 0, output: Number(r.output) || 0 };
+    if (r.cache_read.trim() !== "") p.cache_read = Number(r.cache_read) || 0;
+    if (r.cache_write.trim() !== "") p.cache_write = Number(r.cache_write) || 0;
+    pr[m] = p;
+  }
+  n.pricing = pr;
   n.admin_password = d.admin_password;
   for (const k of TIMEOUTS) n.timeouts[k] = parseDuration(d.timeouts[k]) ?? c.timeouts[k];
   const r: Routing = { strategy: d.routing.strategy, max_attempts: parseInt(d.routing.max_attempts, 10) || 0, session_affinity: d.routing.session_affinity, max_body_mb: parseInt(d.routing.max_body_mb, 10) || 0 };
@@ -88,7 +120,6 @@ export default function Settings() {
   const errs = validate(draft, t);
   const nErr = Object.keys(errs).length;
   const set = <K extends keyof Draft>(k: K, v: Draft[K]) => setDraft({ ...draft, [k]: v });
-  const setKey = (i: number, p: Partial<ClientKey>) => set("api_keys", draft.api_keys.map((k, j) => (j === i ? { ...k, ...p } : k)));
 
   const submit = async () => {
     if (nErr) return;
@@ -139,60 +170,28 @@ export default function Settings() {
               </div>
               <span className="hint">{t("set.dataDirHint")}</span>
             </div>
+            <div style={{ gridColumn: "1 / -1" }}>
+              <Field label={t("set.publicUrl")} hint={t("set.publicUrlHint")} error={errs.public_url}>
+                {(id, d) => (
+                  <input id={id} aria-describedby={d} aria-invalid={!!errs.public_url} className="input mono" value={draft.public_url} placeholder="http://100.x.y.z:8317" onChange={(e) => set("public_url", e.target.value)} />
+                )}
+              </Field>
+            </div>
           </div>
         </section>
 
         <section className="card">
           <div className="card-head">
             <h2 className="grow">{t("set.clientKeys")}</h2>
-            <button
-              className="btn sm"
-              onClick={() => set("api_keys", [...draft.api_keys, { name: `key-${draft.api_keys.length + 1}`, key: randomKey() }])}
-            >
-              <Icon name="plus" size={13} /> {t("set.addKey")}
-            </button>
+            <Badge>{t("set.keysCount", { n: config.api_keys.length })}</Badge>
           </div>
-          <div className="card-body">
-            <p className="muted small" style={{ marginBottom: 10 }}>
-              {draft.api_keys.length === 0 ? t("set.noKeys") : t("set.keysHint")}
+          <div className="card-body row wrap">
+            <p className="muted small grow" style={{ minWidth: 240 }}>
+              {t("set.keysMoved")}
             </p>
-            {draft.api_keys.map((k, i) => (
-              <div key={i} style={{ marginBottom: 8 }}>
-                <div className="row wrap" style={{ alignItems: "center" }}>
-                  <input className="input" style={{ width: 160 }} aria-label={t("set.keyName", { i: i + 1 })} value={k.name} onChange={(e) => setKey(i, { name: e.target.value })} placeholder="name" />
-                  {isMasked(k.key) ? (
-                    <div className="row grow" style={{ minWidth: 180 }}>
-                      <span className="mono ellipsis">{maskHint(k.key)}</span>
-                      <Badge icon="lock">{t("prov.saved")}</Badge>
-                      <button className="btn ghost sm" onClick={() => setKey(i, { key: randomKey() })}>
-                        <Icon name="dice" size={13} /> {t("set.rotate")}
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <input className="input mono grow" style={{ minWidth: 180, flex: 1, width: "auto" }} aria-label={t("set.keyValue", { i: i + 1 })} value={k.key} onChange={(e) => setKey(i, { key: e.target.value })} placeholder="sk-clr-… / env:NAME" />
-                      <button className="btn ghost icon sm" onClick={() => setKey(i, { key: randomKey() })} aria-label={t("set.generate")} title={t("set.generate")}>
-                        <Icon name="dice" size={14} />
-                      </button>
-                      <CopyButton text={k.key} />
-                    </>
-                  )}
-                  <button className="btn ghost icon sm" onClick={() => set("api_keys", draft.api_keys.filter((_, j) => j !== i))} aria-label={t("common.removeX", { x: k.name })}>
-                    <Icon name="trash" size={14} />
-                  </button>
-                </div>
-                {errs[`k.${i}`] && (
-                  <div className="small" style={{ color: "var(--err)", marginTop: 4 }}>
-                    <Icon name="alert" size={12} /> {errs[`k.${i}`]}
-                  </div>
-                )}
-                {!isMasked(k.key) && k.key && !k.key.startsWith("env:") && (
-                  <div className="small faint" style={{ marginTop: 4 }}>
-                    {t("set.copyNow")}
-                  </div>
-                )}
-              </div>
-            ))}
+            <Link className="btn sm" to="/keys">
+              <Icon name="key" size={13} /> {t("set.keysOpen")}
+            </Link>
           </div>
         </section>
 
@@ -294,6 +293,8 @@ export default function Settings() {
             </div>
           </div>
         </section>
+
+        <PricingCard rows={draft.pricing} onChange={(r) => set("pricing", r)} error={errs.pricing} />
       </div>
 
       {(changes.length > 0 || serverErr) && (
@@ -331,5 +332,113 @@ export default function Settings() {
         </div>
       )}
     </div>
+  );
+}
+
+function PricingCard({ rows, onChange, error }: { rows: PriceRow[]; onChange: (r: PriceRow[]) => void; error?: string }) {
+  const t = useT();
+  const info = usePoll((sig) => api.pricing(sig), 0);
+  const [q, setQ] = useState("");
+  const builtin = useMemo(() => {
+    const b = Object.entries(info.data?.builtin || {}).sort(([a], [b2]) => a.localeCompare(b2));
+    const f = q.trim().toLowerCase();
+    return f ? b.filter(([m]) => m.toLowerCase().includes(f)) : b;
+  }, [info.data, q]);
+  const upd = (i: number, k: keyof PriceRow, v: string) => onChange(rows.map((r, j) => (j === i ? { ...r, [k]: v } : r)));
+  const override = (m: string, p: Price) => {
+    if (rows.some((r) => r.model === m)) return;
+    onChange([...rows, toPriceRow(m, p)]);
+  };
+  const fmtP = (v?: number) => (v === undefined ? "–" : `$${v}`);
+  return (
+    <section className="card">
+      <div className="card-head">
+        <h2 className="grow">{t("set.pricing")}</h2>
+        <button className="btn sm" onClick={() => onChange([...rows, { model: "", input: "", output: "", cache_read: "", cache_write: "" }])}>
+          <Icon name="plus" size={13} /> {t("set.addPrice")}
+        </button>
+      </div>
+      <div className="card-body stack">
+        <p className="muted small">{t("set.pricingHint")}</p>
+        {error && <ErrorNote error={error} />}
+        {rows.length === 0 ? (
+          <p className="faint small">{t("set.noOverrides")}</p>
+        ) : (
+          <div className="table-wrap">
+            <table className="tbl price-tbl">
+              <thead>
+                <tr>
+                  <th>{t("set.pricingModel")}</th>
+                  <th className="r">{t("set.priceIn")}</th>
+                  <th className="r">{t("set.priceOut")}</th>
+                  <th className="r">{t("set.priceCacheR")}</th>
+                  <th className="r">{t("set.priceCacheW")}</th>
+                  <th>
+                    <span className="sr-only">{t("common.actions")}</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={i}>
+                    <td style={{ minWidth: 200 }}>
+                      <input className="input mono" aria-label={`${t("set.pricingModel")} ${i + 1}`} value={r.model} placeholder="provider/model" onChange={(e) => upd(i, "model", e.target.value)} />
+                    </td>
+                    {PRICE_FIELDS.map((f) => (
+                      <td key={f} style={{ width: 110 }}>
+                        <input className="input num" inputMode="decimal" aria-label={`${r.model || i + 1} ${f}`} aria-invalid={priceBad(r[f])} value={r[f]} placeholder={f.startsWith("cache") ? "–" : "0"} onChange={(e) => upd(i, f, e.target.value)} />
+                      </td>
+                    ))}
+                    <td className="r">
+                      <button className="btn ghost icon sm" aria-label={t("common.removeX", { x: r.model || String(i + 1) })} onClick={() => onChange(rows.filter((_, j) => j !== i))}>
+                        <Icon name="trash" size={14} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {info.data && (
+          <details className="builtin">
+            <summary>{t("set.builtin", { n: Object.keys(info.data.builtin).length })}</summary>
+            <input className="input" style={{ maxWidth: 260, marginBottom: 8 }} type="search" aria-label={t("set.filterPrices")} placeholder={t("set.filterPrices")} value={q} onChange={(e) => setQ(e.target.value)} />
+            <div className="table-wrap" style={{ maxHeight: 320, overflowY: "auto" }}>
+              <table className="tbl">
+                <thead>
+                  <tr>
+                    <th>{t("set.pricingModel")}</th>
+                    <th className="r">{t("set.priceIn")}</th>
+                    <th className="r">{t("set.priceOut")}</th>
+                    <th className="r">{t("set.priceCacheR")}</th>
+                    <th className="r">{t("set.priceCacheW")}</th>
+                    <th>
+                      <span className="sr-only">{t("common.actions")}</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {builtin.map(([m, p]) => (
+                    <tr key={m}>
+                      <td className="mono">{m}</td>
+                      <td className="r">{fmtP(p.input)}</td>
+                      <td className="r">{fmtP(p.output)}</td>
+                      <td className="r">{fmtP(p.cache_read)}</td>
+                      <td className="r">{fmtP(p.cache_write)}</td>
+                      <td className="r">
+                        <button className="btn xs" disabled={rows.some((r) => r.model === m)} onClick={() => override(m, p)}>
+                          {t("set.override")}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        )}
+      </div>
+    </section>
   );
 }

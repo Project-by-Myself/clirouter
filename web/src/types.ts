@@ -20,9 +20,29 @@ export interface Status {
   auth_required: boolean;
 }
 
+export type BudgetPeriod = "daily" | "weekly" | "monthly" | "total";
+export const BUDGET_PERIODS: BudgetPeriod[] = ["daily", "weekly", "monthly", "total"];
+
 export interface ClientKey {
   name: string;
   key: string;
+  note?: string;
+  models?: string[];
+  budget_usd?: number;
+  budget_tokens?: number;
+  budget_period?: BudgetPeriod;
+  rpm?: number;
+  max_parallel?: number;
+  expires_at?: string;
+  disabled?: boolean;
+  created_at?: string;
+}
+
+export interface Price {
+  input: number;
+  output: number;
+  cache_read?: number;
+  cache_write?: number;
 }
 
 export interface Timeouts {
@@ -61,6 +81,8 @@ export interface Provider {
   disabled: boolean;
   first_byte: number;
   idle: number;
+  budget_usd?: number;
+  budget_period?: BudgetPeriod;
 }
 
 export interface Combo {
@@ -80,6 +102,8 @@ export interface Config {
   providers: Provider[];
   combos: Combo[];
   aliases: Record<string, string>;
+  public_url?: string;
+  pricing?: Record<string, Price>;
 }
 
 export interface AccountStatus {
@@ -96,6 +120,16 @@ export interface AccountStatus {
   last_error_at?: string;
   last_used?: string;
   meta?: Record<string, string>;
+  quota?: QuotaWindow[];
+  quota_at?: string;
+}
+
+export interface QuotaWindow {
+  name: string;
+  used_pct?: number;
+  remaining?: number;
+  limit?: number;
+  resets_at?: string;
 }
 
 export interface RecordT {
@@ -118,6 +152,7 @@ export interface RecordT {
   cache_read_tokens: number;
   cache_write_tokens: number;
   reasoning_tokens: number;
+  cost_usd?: number;
   error?: string;
 }
 
@@ -130,6 +165,7 @@ export interface Bucket {
   cache_read_tokens: number;
   avg_ttfb_ms: number;
   p95_ttfb_ms: number;
+  cost_usd?: number;
 }
 
 export interface Stats {
@@ -202,3 +238,70 @@ export const OAUTH_PROVIDER_TYPE: Record<string, string> = {
   copilot: "copilot",
   "gemini-cli": "gemini-cli",
 };
+
+export interface UsageTotals {
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+}
+
+export type KeyStatus = "active" | "disabled" | "expired" | "over_budget";
+
+export interface KeyUsage extends UsageTotals {
+  name: string;
+  status: KeyStatus;
+  period: BudgetPeriod;
+  period_start: string;
+  period_end?: string;
+  today: UsageTotals;
+  inflight: number;
+  rpm_now: number;
+  last_used?: string;
+}
+
+export interface ProviderUsage extends UsageTotals {
+  id: string;
+  period: BudgetPeriod;
+  period_start: string;
+  period_end?: string;
+  over_budget: boolean;
+}
+
+export interface UsageRow {
+  key: string;
+  requests: number;
+  errors: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number;
+}
+
+export interface UsageDay extends UsageTotals {
+  day: string;
+}
+
+export interface UsageReport {
+  since: string;
+  total: UsageRow;
+  rows: UsageRow[];
+  daily: UsageDay[];
+}
+
+export interface PricingInfo {
+  builtin: Record<string, Price>;
+  overrides: Record<string, Price>;
+}
+
+export interface KeyInfo {
+  name: string;
+  note?: string;
+  status: KeyStatus;
+  models: string[];
+  expires_at?: string;
+  limits: { budget_usd: number; budget_tokens: number; budget_period: BudgetPeriod; rpm: number; max_parallel: number };
+  usage: UsageTotals & { period_start: string; period_end?: string };
+  today: UsageTotals;
+}
