@@ -53,7 +53,7 @@ export const vi = {
   "auth.submit": "Mở khoá",
   "forbidden.title": "Chỉ truy cập từ localhost",
   "forbidden.body": "Admin API chỉ cho phép kết nối từ máy chạy clirouter khi chưa đặt admin_password. Hãy mở dashboard qua 127.0.0.1, hoặc đặt admin_password trong config rồi khởi động lại / chờ hot-reload.",
-  "forbidden.tunnel": "Hoặc dùng SSH tunnel từ máy của anh:",
+  "forbidden.tunnel": "Hoặc dùng SSH tunnel từ máy của bạn:",
 
   "save.ok": "Đã lưu cấu hình",
   "save.fail": "Lưu thất bại",
