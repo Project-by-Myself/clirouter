@@ -85,7 +85,6 @@ export default function Accounts() {
           </div>
         )}
       </div>
-      <OAuthAccounts />
       {error && <div style={{ marginBottom: 12 }}><ErrorNote error={error} /></div>}
       {loading && !data && <div className="faint">{t("common.loading")}</div>}
       {data && data.length === 0 && (
@@ -108,7 +107,7 @@ export default function Accounts() {
             <div className="card-head">
               <h2 className="mono">{prov}</h2>
               <span className="faint small">
-                {accs.length} {t("acc.accountsLc")}
+                {accs.length} {accs.length === 1 ? t("acc.accountLc") : t("acc.accountsLc")}
               </span>
             </div>
             <div className="table-wrap">
@@ -217,6 +216,9 @@ export default function Accounts() {
             </div>
           </div>
         ))}
+      </div>
+      <div style={{ marginTop: 20 }}>
+        <OAuthAccounts />
       </div>
     </div>
   );

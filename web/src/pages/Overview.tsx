@@ -5,7 +5,8 @@ import { fillTimeline, TimelineChart } from "../chart";
 import { usePoll, useStored } from "../hooks";
 import { useT } from "../i18n";
 import { Icon, type IconName } from "../icons";
-import { useStatus } from "../store";
+import type { Key } from "../dict";
+import { useConfig, useStatus } from "../store";
 import type { Bucket } from "../types";
 import { Badge, Empty, ErrorNote } from "../ui";
 import { fmtMs, fmtNum, fmtPct } from "../util";
@@ -13,18 +14,84 @@ import { fmtMs, fmtNum, fmtPct } from "../util";
 const RANGES = ["1h", "6h", "24h", "7d", "30d"] as const;
 type Range = (typeof RANGES)[number];
 
-function Kpi({ label, value, sub, icon, tone }: { label: string; value: string; sub?: ReactNode; icon: IconName; tone?: "err" | "warn" | "ok" }) {
+function Kpi({ label, value, unit, sub, icon, tone }: { label: string; value: string; unit?: string; sub?: ReactNode; icon: IconName; tone?: "err" | "warn" | "ok" }) {
   return (
-    <div className="kpi">
+    <div className={`kpi ${tone ? `tone-${tone}` : ""}`}>
       <div className="label">
-        <Icon name={icon} size={13} />
+        <span className="k-icon">
+          <Icon name={icon} size={15} />
+        </span>
         {label}
       </div>
-      <div className="value" style={tone ? { color: `var(--${tone})` } : undefined}>
+      <div className="value" style={tone && tone !== "ok" ? { color: `var(--${tone})` } : undefined}>
         {value}
+        {unit && <small>{unit}</small>}
       </div>
-      <div className="sub">{sub ?? " "}</div>
+      <div className="sub">{sub ?? "\u00a0"}</div>
     </div>
+  );
+}
+
+function MiniStat({ icon, label, value, tone }: { icon: IconName; label: string; value: ReactNode; tone?: "warn" | "err" }) {
+  return (
+    <div className="mini-stat">
+      <Icon name={icon} size={16} />
+      <div className="grow">
+        <div className="ms-label">{label}</div>
+        <div className="ms-value" style={tone ? { color: `var(--${tone})` } : undefined}>
+          {value}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** First-run checklist. Hidden once every step is done or the user dismisses it. */
+function SetupGuide({ hasRequests }: { hasRequests: boolean }) {
+  const t = useT();
+  const { status } = useStatus();
+  const { config } = useConfig();
+  const [dismissed, setDismissed] = useStored<"0" | "1">("clr.setupDismissed", "0");
+  const [visitedInt] = useStored<"0" | "1">("clr.visitedIntegrations", "0");
+  if (!status || !config || dismissed === "1") return null;
+  const steps: { done: boolean; to: string; title: Key; body: Key; cta: Key }[] = [
+    { done: status.providers > 0, to: "/providers", title: "setup.s1", body: "setup.s1b", cta: "setup.s1c" },
+    { done: config.api_keys.length > 0, to: "/settings", title: "setup.s2", body: "setup.s2b", cta: "setup.s2c" },
+    { done: hasRequests, to: "/playground", title: "setup.s3", body: "setup.s3b", cta: "setup.s3c" },
+    { done: visitedInt === "1", to: "/integrations", title: "setup.s4", body: "setup.s4b", cta: "setup.s4c" },
+  ];
+  const n = steps.filter((s) => s.done).length;
+  if (n === steps.length) return null;
+  return (
+    <section className="card setup" aria-labelledby="setup-title">
+      <div className="setup-head">
+        <div className="grow">
+          <h2 id="setup-title">{t("setup.title")}</h2>
+          <p className="muted small" style={{ marginTop: 4 }}>
+            {t("setup.body", { n, total: steps.length })}
+          </p>
+          <div className="setup-progress" aria-hidden="true">
+            <i style={{ width: `${(n / steps.length) * 100}%` }} />
+          </div>
+        </div>
+        <button className="btn ghost sm" onClick={() => setDismissed("1")}>
+          {t("setup.dismiss")}
+        </button>
+      </div>
+      <div className="steps">
+        {steps.map((s, i) => (
+          <Link key={s.to} to={s.to} className={`step ${s.done ? "done" : ""}`}>
+            <span className="s-num">{s.done ? <Icon name="check" size={13} strokeWidth={3} /> : i + 1}</span>
+            <span className="s-title">{t(s.title)}</span>
+            <span className="s-body">{t(s.body)}</span>
+            <span className="s-cta">
+              {s.done ? t("setup.done") : t(s.cta)}
+              {!s.done && <Icon name="right" size={13} />}
+            </span>
+          </Link>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -42,6 +109,7 @@ export default function Overview() {
   const errRate = tot && tot.requests ? tot.errors / tot.requests : 0;
   const cachePct = tot && tot.input_tokens ? tot.cache_read_tokens / tot.input_tokens : 0;
   const m = status?.metrics;
+  const hasRequests = (m?.total || 0) > 0 || (tot?.requests || 0) > 0;
 
   return (
     <div className="stack-lg">
@@ -59,6 +127,8 @@ export default function Overview() {
         </div>
       </div>
 
+      <SetupGuide hasRequests={hasRequests} />
+
       {stats.error && !st && <ErrorNote error={stats.error} />}
 
       <div className="kpis" aria-busy={!st}>
@@ -67,22 +137,40 @@ export default function Overview() {
           icon="alert"
           label={t("ov.errorRate")}
           value={tot ? fmtPct(errRate) : "–"}
-          tone={errRate > 0.1 ? "err" : errRate > 0.02 ? "warn" : undefined}
+          tone={errRate > 0.1 ? "err" : errRate > 0.02 ? "warn" : "ok"}
           sub={tot ? `${fmtNum(tot.errors)} ${t("ov.errorsLc")}` : undefined}
         />
-        <Kpi icon="clock" label={t("ov.avgTtfb")} value={tot ? fmtMs(tot.avg_ttfb_ms) : "–"} sub={m ? `${t("ov.live")}: ${fmtMs(m.avg_ttfb_ms)}` : undefined} />
-        <Kpi icon="clock" label={t("ov.p95Ttfb")} value={tot ? fmtMs(tot.p95_ttfb_ms) : "–"} />
-        <Kpi icon="down" label={t("ov.tokIn")} value={tot ? fmtNum(tot.input_tokens) : "–"} />
-        <Kpi icon="up" label={t("ov.tokOut")} value={tot ? fmtNum(tot.output_tokens) : "–"} />
-        <Kpi icon="bolt" label={t("ov.cacheRead")} value={tot ? fmtPct(cachePct) : "–"} sub={tot ? `${fmtNum(tot.cache_read_tokens)} tok` : undefined} />
-        <Kpi icon="play" label={t("ov.inflight")} value={m ? String(m.inflight) : "–"} sub={status ? t("ov.providersAccounts", { p: status.providers, a: status.accounts }) : undefined} />
+        <Kpi icon="clock" label={t("ov.avgTtfb")} value={tot ? fmtMs(tot.avg_ttfb_ms) : "–"} sub={tot ? `p95 ${fmtMs(tot.p95_ttfb_ms)}${m && m.total > 0 ? ` · ${t("ov.live")} ${fmtMs(m.avg_ttfb_ms)}` : ""}` : undefined} />
         <Kpi
+          icon="bolt"
+          label={t("ov.tokens")}
+          value={tot ? fmtNum(tot.input_tokens) : "–"}
+          unit={tot ? `/ ${fmtNum(tot.output_tokens)}` : undefined}
+          sub={tot ? `${t("ov.cacheRead")} ${fmtPct(cachePct)} · ${fmtNum(tot.cache_read_tokens)} tok` : undefined}
+        />
+      </div>
+
+      <div className="mini-stats">
+        <MiniStat icon="play" label={t("ov.inflight")} value={m ? m.inflight : "–"} />
+        <MiniStat icon="providers" label={t("nav.providers")} value={status ? t("ov.providersAccounts", { p: status.providers, a: status.accounts }) : "–"} />
+        <MiniStat
           icon="accounts"
           label={t("ov.cooling")}
-          value={status ? String(status.accounts_cooling) : "–"}
           tone={status && status.accounts_cooling > 0 ? "warn" : undefined}
-          sub={status && status.dropped_records > 0 ? t("ov.dropped", { n: status.dropped_records }) : status ? <Link to="/accounts">{t("ov.viewAccounts")}</Link> : undefined}
+          value={
+            status ? (
+              <span className="row" style={{ gap: 8 }}>
+                {status.accounts_cooling}
+                <Link to="/accounts" className="small" style={{ fontWeight: 500 }}>
+                  {t("ov.viewAccounts")}
+                </Link>
+              </span>
+            ) : (
+              "–"
+            )
+          }
         />
+        {status && status.dropped_records > 0 && <MiniStat icon="alert" label={t("ov.droppedLabel")} tone="warn" value={fmtNum(status.dropped_records)} />}
       </div>
 
       {status && status.providers === 0 && (

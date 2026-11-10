@@ -1,200 +1,393 @@
 # clirouter
 
-Gateway LLM tốc độ cao cho coding agent (Claude Code, Codex CLI, Cursor, Cline, Gemini CLI…).
-Một endpoint duy nhất, định tuyến tới Anthropic, OpenAI, Gemini/Vertex, mọi provider
-OpenAI-compatible, và tài khoản subscription qua OAuth. Một binary Go (~13 MB, ~25 MB RAM),
-dashboard nhúng sẵn.
+**A fast, single-binary LLM gateway for coding agents.**
+Point Claude Code, Codex CLI, Cursor, Cline, opencode or Gemini CLI at one local endpoint, and
+clirouter routes each request to Anthropic, OpenAI, Gemini/Vertex, any OpenAI-compatible API
+(OpenRouter, MiniMax, DeepSeek…) or a subscription account via OAuth, translating between API
+formats on the fly. It ships as one Go binary (~13 MB, ~25 MB RAM) with an embedded dashboard.
 
-![Dashboard clirouter — trang Tổng quan](docs/images/overview.png)
+[![CI](https://github.com/Project-by-Myself/clirouter/actions/workflows/ci.yml/badge.svg)](https://github.com/Project-by-Myself/clirouter/actions/workflows/ci.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+
+![clirouter dashboard — Overview](docs/images/overview.png)
+
+## Features
+
+- **One endpoint, every protocol.** Anthropic Messages, OpenAI Chat Completions, OpenAI
+  Responses and Gemini `generateContent`. Any client format can reach any provider.
+- **Byte-exact passthrough** when the client and provider speak the same format. Otherwise
+  requests are translated through a typed intermediate representation, including streaming, tool
+  calls and usage.
+- **Failover that clients never see.** HTTP errors, timeouts and in-band errors at the start of a
+  stream (e.g. `overloaded_error` after a 200) move to the next account or provider before any
+  content reaches the client.
+- **Smart cooldowns.** Honors `Retry-After` and quota headers on 429s, cools down per model, and
+  treats quota exhaustion differently from a single 5xx, so one transient error never benches an
+  account.
+- **Multi-key rotation.** Round-robin, fill-first or least-busy across keys, plus session
+  affinity so prompt caches keep hitting.
+- **Combos and aliases.** Build one model name out of several targets (`fallback` or
+  `round-robin`), and remap the model names your tools hard-code.
+- **Dashboard.** Live request tail, latency and token charts, per-account health,
+  provider/combo editors, a playground, and copy-paste setup for every supported tool on macOS,
+  Linux and Windows. Light/dark theme, English/Vietnamese.
+- **Hot reload.** Edit `config.yaml` or use the dashboard; changes apply within ~2 s without a
+  restart.
+- **Secure by default.** Binds to localhost. Client keys are stored hashed, OAuth tokens are
+  encrypted at rest, and secrets are redacted from logs. See [Security](#security).
+
+## How it works
 
 ```mermaid
 flowchart LR
-  subgraph C[Coding agent]
+  subgraph C[Coding agents]
     CC[Claude Code]
     CX[Codex CLI]
     CU[Cursor / Cline / opencode]
     GC[Gemini CLI]
   end
-  subgraph R[clirouter :8317]
+  subgraph R["clirouter :8317"]
     direction TB
     P["Data plane<br/>/v1/messages · /v1/chat/completions<br/>/v1/responses · /v1beta"]
     RT["Router<br/>alias → combo → provider/model<br/>cooldown · failover · affinity"]
-    TR["Translate qua IR<br/>(passthrough khi cùng định dạng)"]
-    D[("SQLite log<br/>ghi theo lô")]
+    TR["Translator (typed IR)<br/>passthrough when formats match"]
+    D[("SQLite request log<br/>batched writes")]
     UI["Dashboard + /admin/api"]
     P --> RT --> TR
-    P -. bất đồng bộ .-> D
+    P -. async .-> D
     UI --- D
   end
-  subgraph U[Upstream]
+  subgraph U[Upstreams]
     A[Anthropic]
     O[OpenAI]
     G[Gemini / Vertex]
-    OC["OpenAI-compatible<br/>(OpenRouter, MiniMax…)"]
-    S["Subscription OAuth<br/>(Codex, Claude, Copilot, Gemini CLI)"]
+    OC["OpenAI-compatible<br/>(OpenRouter, MiniMax, …)"]
+    S["Subscriptions via OAuth<br/>(Codex, Claude, Copilot, Gemini CLI)"]
   end
   C --> P
   TR --> A & O & G & OC & S
 ```
 
-## Chạy nhanh
+A request flows like this:
+
+1. **Authenticate** the client key (`Authorization: Bearer`, `x-api-key` or `x-goog-api-key`).
+2. **Resolve the model** in this order: alias → combo → `provider/model` → a provider that lists
+   the model in `models`/`model_map` → a provider with no model list in the same family
+   (`claude*`, `gpt*`/`o*`, `gemini*`).
+3. **Pick an account** that isn't cooling down, using the routing strategy and session affinity.
+4. **Send upstream.** Use passthrough when the formats match, otherwise translate. Stream back
+   with per-format keepalive pings.
+5. **On failure before the first content byte**, record a cooldown and retry the next
+   account/target, up to `routing.max_attempts`.
+6. **Log** the result asynchronously: tokens, TTFB, attempts and redacted errors.
+
+## Quick start
+
+Requirements: Go 1.27+, and Node 20+ to build the dashboard.
 
 ```bash
-make build            # build dashboard + binary (cần Node 20+ và Go 1.27+)
-./bin/clirouter       # lần đầu tự tạo ~/.clirouter/config.yaml
+git clone https://github.com/Project-by-Myself/clirouter.git
+cd clirouter
+make build          # builds the dashboard, then bin/clirouter
+./bin/clirouter     # first run creates ~/.clirouter/config.yaml
 ```
 
-Mở dashboard tại http://127.0.0.1:8317 → **Providers** → thêm provider và key.
+Then:
 
-## Kết nối client
+1. Open **http://127.0.0.1:8317**.
+2. **Providers → Add provider**: pick a type, then paste one or more API keys.
+3. **Settings → Client API keys → Generate key**, if anything other than this machine will
+   connect.
+4. **Playground**: send a test message.
+5. **Integrations**: copy the config for your tool. The Overview page walks you through these
+   steps.
 
-| Client | Cấu hình |
-|---|---|
-| Claude Code | `ANTHROPIC_BASE_URL=http://127.0.0.1:8317` · `ANTHROPIC_AUTH_TOKEN=<client key>` |
-| Codex CLI | `~/.codex/config.toml`: `[model_providers.clirouter]` `base_url = "http://127.0.0.1:8317/v1"`, `wire_api = "responses"`, `env_key = "CLIROUTER_API_KEY"` |
-| Cursor / Cline / opencode | OpenAI base URL `http://127.0.0.1:8317/v1` |
-| Gemini CLI | `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8317` |
+Flags: `--config <path>` (default `~/.clirouter/config.yaml`) and `--listen <host:port>`.
+Cross-compile release binaries for macOS, Linux and Windows with `make release`.
 
-Trang **Kết nối** trong dashboard sinh sẵn snippet theo cấu hình hiện tại.
+## Connect your tools
 
-## Endpoint
+The **Integrations** page generates these snippets with your real address, model and key, for
+macOS/Linux shells and Windows PowerShell. It also has a **Test connection** button.
 
-`POST /v1/messages` (+`/count_tokens`) · `POST /v1/chat/completions` · `POST /v1/responses` ·
-`POST /v1beta/models/{model}:streamGenerateContent|generateContent` · `GET /v1/models` ·
-`GET /healthz` · `GET /metrics` (Prometheus, cần client key như `/v1/models`) · `/admin/api/*` (dashboard).
+| Tool | Protocol | Setup |
+|---|---|---|
+| **Claude Code** | `/v1/messages` | `ANTHROPIC_BASE_URL=http://127.0.0.1:8317`, `ANTHROPIC_AUTH_TOKEN=<client key>`, `ANTHROPIC_MODEL=<model>`, plus `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` |
+| **Codex CLI** | `/v1/responses` | `~/.codex/config.toml` → `[model_providers.clirouter]` with `base_url = "http://127.0.0.1:8317/v1"`, `wire_api = "responses"`, `env_key = "CLIROUTER_API_KEY"` |
+| **Cursor / Cline / Continue / opencode** | `/v1/chat/completions` | OpenAI-compatible base URL `http://127.0.0.1:8317/v1` + client key |
+| **Gemini CLI** | `/v1beta` | `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8317`, `GEMINI_API_KEY=<client key>` |
+| **Any OpenAI / Anthropic SDK** | all | Set the SDK's base URL to clirouter and use a client key as the API key |
 
-## Chọn model
+Claude Code example (macOS/Linux):
 
-Theo thứ tự: **alias** → **combo** → `provider/model` → provider khai báo model đó trong
-`models`/`model_map` → provider không khai báo model nào nhưng cùng họ (`claude*`, `gpt*/o*`, `gemini*`).
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
+export ANTHROPIC_AUTH_TOKEN=sk-clr-...            # a client key from Settings
+export ANTHROPIC_MODEL=coding                     # a model, alias or combo
+export ANTHROPIC_DEFAULT_OPUS_MODEL=coding
+export ANTHROPIC_DEFAULT_SONNET_MODEL=coding
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5
+claude
+```
+
+Windows PowerShell:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8317"
+$env:ANTHROPIC_AUTH_TOKEN = "sk-clr-..."
+$env:ANTHROPIC_MODEL = "coding"
+claude
+```
+
+> Setting all three `ANTHROPIC_DEFAULT_*_MODEL` variables makes `/model`, subagents and
+> background tasks go through clirouter too, not just the main model.
+
+## Configuration
+
+Everything lives in `~/.clirouter/config.yaml`. The dashboard edits the same file. Values written
+`env:NAME` are read from environment variables.
 
 ```yaml
+listen: 127.0.0.1:8317
+
+api_keys:                       # client keys; empty = only this machine may call the API
+  - name: laptop
+    key: sha256:9f86d0…          # stored hashed when created from the dashboard
+
 providers:
   - id: anthropic
     type: anthropic
-    keys: [env:ANTHROPIC_API_KEY, env:ANTHROPIC_API_KEY_2]   # nhiều key = xoay vòng
+    keys: [env:ANTHROPIC_API_KEY, env:ANTHROPIC_API_KEY_2]   # several keys = rotation
   - id: openrouter
     type: openai-compatible
     base_url: https://openrouter.ai/api/v1
     keys: [env:OPENROUTER_API_KEY]
     models: [z-ai/glm-4.6]
-    priority: 1                    # số nhỏ được thử trước
+    model_map: { glm: z-ai/glm-4.6 }   # client name → upstream name
+    priority: 1                         # lower is tried first
+
 combos:
   - name: coding
-    strategy: fallback             # hoặc round-robin
+    strategy: fallback                  # or round-robin
     targets: [anthropic/claude-sonnet-4-5, openrouter/z-ai/glm-4.6]
+
 aliases:
-  claude-sonnet-4-5-20250929: coding   # Claude Code gọi model này → đi qua combo
+  claude-sonnet-4-5-20250929: coding    # a model your tool hard-codes → the combo
+
+timeouts:            # 0 = use the default shown here
+  connect: 10s       # TCP + TLS to upstream
+  first_byte: 90s    # request sent → first byte of a stream (non-streaming calls wait ≥ 10m)
+  idle: 180s         # max silence between chunks (re-armed on every byte)
+  total: 60m         # hard cap per request
+  early_ping: 2s     # commit 200 + send a ping if upstream is slow to start (0 = off)
+  keepalive: 15s     # ping interval while the client sees no bytes (0 = off)
+
+routing:
+  strategy: round-robin     # round-robin | fill-first | least-busy
+  max_attempts: 6
+  session_affinity: true
+  max_body_mb: 64
+
+logging:
+  level: info
+  retention_days: 14
+  capture_bodies: false     # store bodies of failed requests for debugging
 ```
 
-Loại provider: `anthropic`, `openai`, `openai-compatible`, `gemini`, `vertex`, `codex`,
-`claude-oauth`, `copilot`, `gemini-cli`. Key dạng `env:NAME` đọc từ biến môi trường.
-Config được theo dõi và nạp lại nóng (2 s), không cần restart (trừ `listen`).
+**Provider types**
+
+| Type | Default base URL | Auth |
+|---|---|---|
+| `anthropic` | `https://api.anthropic.com` | API key |
+| `openai` | `https://api.openai.com/v1` | API key |
+| `openai-compatible` | *(required)* | API key |
+| `gemini` | `https://generativelanguage.googleapis.com` | API key |
+| `vertex` | `https://aiplatform.googleapis.com` | API key |
+| `codex` | `https://chatgpt.com/backend-api/codex` | OAuth (ChatGPT) |
+| `claude-oauth` | `https://api.anthropic.com` | OAuth (Claude) |
+| `copilot` | `https://api.githubcopilot.com` | OAuth (GitHub device flow) |
+| `gemini-cli` | `https://cloudcode-pa.googleapis.com` | OAuth (Google) |
+
+Each provider can also set `headers`, an outbound `proxy`, `disabled: true`, and per-provider
+`first_byte` / `idle` timeouts. Config changes hot-reload within ~2 s. Only `listen` needs a
+restart. A one-off `--listen` flag applies to that run only and is never written back to the
+file. If a hand-edited file is invalid, the last good config keeps running and the error is
+logged.
+
+## API reference
+
+### Inference (client key required when `api_keys` is set)
+
+| Method | Path | Format |
+|---|---|---|
+| `POST` | `/v1/messages` | Anthropic Messages (streaming and non-streaming) |
+| `POST` | `/v1/messages/count_tokens` | Anthropic token counting |
+| `POST` | `/v1/chat/completions` (also `/chat/completions`) | OpenAI Chat Completions |
+| `POST` | `/v1/responses` (also `/responses`) | OpenAI Responses |
+| `POST` | `/v1beta/models/{model}:generateContent` · `:streamGenerateContent` | Gemini |
+| `GET` | `/v1/models`, `/v1beta/models` | Models, combos and aliases you can call |
+| `GET` | `/healthz` | Liveness, no auth |
+| `GET` | `/metrics` | Prometheus metrics (client key) |
+
+### Admin (dashboard; `Authorization: Bearer <admin_password>` when one is set)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/admin/api/status` | Version, uptime, listen address, live metrics, account counts |
+| `GET` · `PUT` | `/admin/api/config` | Read (secrets masked) / replace the whole config; validated, written atomically, hot-reloaded |
+| `GET` | `/admin/api/accounts` | Per key/account health, cooldowns, last error |
+| `POST` | `/admin/api/accounts/{id}/reset` | Clear an account's cooldown and error state |
+| `GET` | `/admin/api/requests?limit&before&provider&model&errors` | Request history (paged) |
+| `GET` | `/admin/api/live?n=100` | Most recent requests, including in-flight |
+| `GET` | `/admin/api/stats?range=1h\|6h\|24h\|7d\|30d` | Totals, timeline, and breakdowns by model/provider/key |
+| `GET` | `/admin/api/models` | Routable model ids with their owner |
+| `POST` | `/admin/api/oauth/start` · `/complete` | Start/finish an OAuth login (redirect, paste-code or device flow) |
+| `GET` | `/admin/api/oauth/status?flow_id=` | Poll a login flow |
+| `GET` · `DELETE` | `/admin/api/oauth/accounts[/{id}]` | List / remove stored OAuth accounts |
 
 ## Dashboard
 
-Ảnh chụp với cấu hình demo (provider giả lập chạy local, key giả).
+Screenshots use a demo config: a local mock provider and fake keys.
 
 | | |
 |---|---|
-| ![Providers](docs/images/providers.png) | ![Tài khoản](docs/images/accounts.png) |
-| **Providers** — loại, endpoint, số key, model, ưu tiên; bật/tắt nóng. | **Tài khoản** — trạng thái từng key: cooldown theo model, OK/lỗi, lỗi gần nhất. |
-| ![Combo & Alias](docs/images/combos.png) | ![Requests](docs/images/requests.png) |
-| **Combo & Alias** — gom nhiều target thành một tên model (fallback / round-robin). | **Requests** — log từng request: model, provider, TTFB, token, số lần thử. |
-| ![Kết nối](docs/images/integrations.png) | ![Giao diện tối](docs/images/overview-dark.png) |
-| **Kết nối** — snippet cấu hình sẵn cho Claude Code, Codex CLI, Cursor, Gemini CLI, curl. | Giao diện tối, song ngữ Việt / Anh (phím `t`, `l`). |
+| ![Providers](docs/images/providers.png) | ![Accounts](docs/images/accounts.png) |
+| **Providers**: type, endpoint, key count, models, priority; toggle live. | **Accounts**: per-key health, per-model cooldowns, OK/fail counts, last error, OAuth logins. |
+| ![Combos & aliases](docs/images/combos.png) | ![Requests](docs/images/requests.png) |
+| **Combos & aliases**: one model name over several targets (fallback / round-robin). | **Requests**: live tail and history with model → provider/upstream, TTFB, tokens, attempts. |
+| ![Integrations](docs/images/integrations.png) | ![Dark theme](docs/images/overview-dark.png) |
+| **Integrations**: copy-paste setup for each tool on macOS/Linux and Windows, with a connection test. | Dark theme, English / Vietnamese. Keys: `1`–`8` pages, `t` theme, `l` language. |
 
-## Thiết kế cho ổn định và tốc độ
+## Built for stability and speed
 
-- **Data plane tách khỏi dashboard.** Request suy luận không đi qua framework/middleware nào.
-- **Passthrough byte-nguyên-vẹn** khi client và provider cùng định dạng: không parse JSON từng
-  chunk, chỉ đọc usage ở event có chứa nó. Khác định dạng thì dịch qua IR có kiểu, encode thẳng
-  sang định dạng client (0 alloc mỗi text chunk).
-- **Không I/O đồng bộ trên hot path.** Trạng thái định tuyến nằm trong RAM, khoá theo từng
-  account. Log request đi qua kênh có giới hạn tới một writer SQLite ghi theo lô; kênh đầy thì
-  bỏ và đếm, không bao giờ chặn request.
-- **Timeout tách bạch:** `connect` · `first_byte` (tới byte dữ liệu đầu tiên) · `idle` (im lặng
-  giữa các chunk, re-arm mỗi lần nhận byte) · `total`. Client ngắt kết nối thì hủy upstream ngay.
-- **Keepalive:** sau `early_ping` gửi header 200 + ping đúng chuẩn từng định dạng
-  (`event: ping` cho Anthropic, comment SSE cho OpenAI), lặp lại mỗi `keepalive` khi im lặng.
-- **Failover trước nội dung đầu tiên:** lỗi HTTP, timeout, hoặc lỗi in-band ngay đầu stream
-  (ví dụ `overloaded_error` sau 200) đều chuyển account/provider khác mà client không thấy.
-  Sau khi đã gửi nội dung, lỗi được báo in-band đúng định dạng client.
-- **Cooldown thông minh:** 429 tôn trọng `Retry-After`/header quota, khoá theo model; hết quota
-  khoá cả account; 400 không khoá; một lỗi 5xx lẻ không loại account. Cooldown ngắn (≤5 s) thì
-  chờ thay vì trả 429.
-- **Session affinity:** các lượt cùng hội thoại dính một account để giữ prompt cache.
-- **Pool kết nối HTTP/2** dùng chung theo proxy, tắt gzip upstream (gzip làm SSE bị dồn cục).
-- **Credential OAuth mã hoá AES-256-GCM**, ghi file nguyên tử, refresh single-flight + chạy nền.
+- **Data plane separate from the dashboard.** Inference requests go through no framework or
+  middleware chain.
+- **No synchronous I/O on the hot path.** Routing state lives in memory with per-account locks.
+  Request logs go through a bounded channel to a batching SQLite writer. If the channel is full,
+  records are dropped and counted; a request is never blocked.
+- **Zero-copy passthrough**: same-format streams are forwarded without parsing every chunk, and
+  only the usage-bearing events are inspected. Cross-format streams are encoded directly into the
+  client format, with zero allocations per text chunk.
+- **Separate timeouts** for connect, first byte, idle and total. A client disconnect cancels the
+  upstream request immediately.
+- **Keepalive.** After `early_ping`, clirouter commits a 200 and sends format-correct pings
+  (`event: ping` for Anthropic, SSE comments for OpenAI) so clients and proxies don't time out.
+- **Errors after content has started** are reported in-band in the client's own format.
+- **Shared HTTP/2 connection pools** per proxy. Upstream gzip is off, because it batches SSE.
+- **OAuth credentials** are encrypted with AES-256-GCM, written atomically, and refreshed in the
+  background with single-flight.
+- **Tested end to end** against mock upstreams. The suite covers:
+  - all 4 client formats × 5 upstream types, streaming and non-streaming, including tools,
+    images, thinking and usage, with output checked against each spec;
+  - failover on 429, 5xx, 529, connection refused, timeouts and in-band overload errors;
+  - client cancellation and graceful shutdown;
+  - 200 parallel streams under `-race` with no goroutine or file-descriptor leaks.
 
-## Bảo mật
+  Unit and regression tests run in CI with `go test -race`; benchmarks run with `make bench`.
 
-clirouter giữ API key/token OAuth của mọi provider, nên mặc định khoá chặt:
+## Security
 
-- **Bind `127.0.0.1:8317`.** Khi chưa có `api_keys`, API suy luận chỉ nhận request trực tiếp từ
-  máy này. Khi chưa có `admin_password`, dashboard/admin API cũng chỉ mở cho localhost — và chỉ
-  khi Host là `localhost`/`127.0.0.1`/`[::1]` (chặn DNS rebinding), không có header reverse proxy
-  (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`).
-- **Mở ra mạng (`listen: 0.0.0.0:8317` hoặc `--listen`)**: nếu chưa đặt `admin_password`, lần
-  khởi động đầu clirouter tự sinh mật khẩu ngẫu nhiên và ghi vào `config.yaml` (không in ra log) —
-  đọc nó trong file config rồi nhập ở dashboard. Muốn tự đặt: `admin_password: env:CLIROUTER_ADMIN_PASSWORD`.
-  Hãy thêm `api_keys` để máy khác dùng được API suy luận. Không gỡ được mật khẩu qua dashboard khi đang expose.
-- **Admin API** nhận `Authorization: Bearer <admin_password>`, so sánh constant-time, khoá IP 5 phút
-  sau 10 lần sai; từ chối mọi request trình duyệt khác origin (`Origin`/`Sec-Fetch-Site`), không bật CORS.
-  Dashboard trả CSP, `X-Frame-Options: DENY`, `nosniff`.
-- **Client key** so sánh constant-time, khoá IP 1 phút sau 30 lần sai. Key tạo/lưu qua dashboard
-  được lưu dạng băm `sha256:<hex>` (chỉ hiện một lần lúc tạo — hãy copy ngay); có thể tự ghi
-  `key: sha256:$(printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1)` vào config.
-- **Quyền file**: `~/.clirouter` 0700, `config.yaml` 0600, `data/` 0700, `clirouter.db` 0600, token
-  OAuth trong `data/auth/` mã hoá AES-256-GCM (khoá ở `data/auth/.key`, 0600). Khi khởi động, file
-  có quyền lỏng hơn sẽ được siết lại. Key provider trong `config.yaml` là plaintext — dùng `env:NAME`
-  nếu không muốn ghi key ra đĩa.
-- **Không log secret**: log chỉ ghi tên client key; thông báo lỗi upstream (kể cả bản lưu SQLite và
-  `last_error` của tài khoản) được che các chuỗi giống key/token. Admin API chỉ trả 4 ký tự cuối của key.
-- **Upstream** không follow redirect (Authorization không bị mang sang host khác).
-- **Giới hạn đầu vào**: body tối đa `routing.max_body_mb` (kể cả sau giải nén gzip/zstd), header 1 MB
-  và 10 s, body phải gửi xong trong 2 phút, mỗi lần ghi cho client tối đa 2 phút.
+clirouter holds every provider key and OAuth token, so it is locked down by default.
 
-**Đưa ra Internet**: đặt sau reverse proxy có TLS (Caddy/nginx), luôn đặt `admin_password` và
-`api_keys`, để clirouter bind `127.0.0.1` và chỉ proxy cổng đó. Ví dụ Caddy:
+- **Binds `127.0.0.1:8317`.** With no `api_keys`, the inference API only accepts direct local
+  requests. With no `admin_password`, the dashboard is localhost-only too. The `Host` header must
+  be `localhost` / `127.0.0.1` / `[::1]`, which blocks DNS rebinding, and requests carrying
+  reverse-proxy headers are rejected.
+- **Exposing it** (`listen: 0.0.0.0:8317` or `--listen`): if no `admin_password` is set, the
+  first start generates a random one and writes it to `config.yaml`. It is never logged. You can
+  also set your own with `admin_password: env:CLIROUTER_ADMIN_PASSWORD`. Add `api_keys` so other
+  machines can call the inference API.
+- **Admin API**: bearer password compared in constant time, with a 5-minute IP lockout after 10
+  failures. Cross-origin browser requests are refused (`Origin` / `Sec-Fetch-Site`) and CORS is
+  off. The dashboard sends a strict CSP, `X-Frame-Options: DENY` and `nosniff`.
+- **Client keys**: compared in constant time, with a 1-minute IP lockout after 30 failures. Behind
+  a reverse proxy on the same host, failures are counted per `X-Forwarded-For` / `X-Real-IP`, so
+  one bad client can't lock everyone out. Keys
+  created in the dashboard are stored as `sha256:<hex>` and shown only once, so copy them right
+  away. To hash one yourself:
+  `key: sha256:$(printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1)`.
+- **File permissions**: `~/.clirouter` 0700, `config.yaml` 0600, `data/` 0700,
+  `clirouter.db` 0600. OAuth tokens in `data/auth/` are AES-256-GCM encrypted. Looser
+  permissions are tightened at startup. Provider keys in `config.yaml` are plaintext; use
+  `env:NAME` to keep them off disk.
+- **No secrets in logs.** Only client key *names* are logged, and upstream error messages
+  (including stored ones) are redacted. The admin API returns only the last 4 characters of a key.
+- **Upstream redirects are not followed**, so `Authorization` never leaks to another host.
+- **Input limits**: body ≤ `routing.max_body_mb` (also after gzip/zstd decoding). Headers are
+  capped at 1 MB and 10 s. A body must arrive within 2 min, and each write to a slow client is
+  capped at 2 min.
+
+**Exposing it to a network or the Internet**: keep clirouter on `127.0.0.1` and put it behind a
+TLS reverse proxy, always with `admin_password` and `api_keys`. Example with Caddy:
 
 ```
 llm.example.com {
     reverse_proxy 127.0.0.1:8317 {
-        flush_interval -1   # không buffer SSE
+        flush_interval -1   # don't buffer SSE
     }
 }
 ```
 
-Báo lỗ hổng: xem [SECURITY.md](SECURITY.md).
+For a small team on a private network, an SSH tunnel or a mesh VPN (e.g. Tailscale) to a
+localhost-bound clirouter is the simplest safe setup.
 
-## Không làm (có chủ đích)
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
-MITM / sửa `/etc/hosts` / cài root CA · giả mạo header, TLS fingerprint hay system prompt của
-client chính chủ · provider scrape web · gửi request sang LLM bên thứ ba để định tuyến ·
-cộng khống token usage.
+## Non-goals
 
-## Giới hạn đã biết
+These are deliberately left out:
 
-- **Tài khoản subscription (OAuth)**: luồng đăng nhập Codex/Claude/Copilot/Gemini CLI đã có
-  nhưng **chưa kiểm chứng với server thật**. Vì không giả danh client chính chủ, provider có thể
-  từ chối (Anthropic có thể chỉ chấp nhận token subscription từ Claude Code; backend Codex có thể
-  yêu cầu `instructions` chính thức; Copilot có thể từ chối `Editor-Version` khác VS Code).
-  Dùng subscription qua proxy có thể vi phạm điều khoản của provider — tự cân nhắc.
-- Chưa hỗ trợ Cursor, Kiro, Codex WebSocket, Vertex service account.
+- MITM, `/etc/hosts` hijacking or installing root CAs.
+- Spoofing first-party clients' headers, TLS fingerprints or system prompts.
+- Web-scraping "providers".
+- Sending your prompts to a third-party LLM to decide routing.
+- Inflating token usage.
 
-## Phát triển
+## Known limitations
+
+- **Subscription (OAuth) providers.** The Codex, Claude, Copilot and Gemini CLI login flows are
+  implemented but **not yet verified against the live services**. clirouter doesn't impersonate
+  first-party clients, so a provider may reject requests: Anthropic may accept subscription
+  tokens only from Claude Code, Codex may require its official `instructions`, and Copilot may
+  reject a non-VS Code `Editor-Version`. Using a subscription through a proxy may also violate
+  the provider's terms; your call.
+- Not supported yet: Cursor/Kiro as upstreams, Codex WebSocket transport, and Vertex service
+  accounts.
+- **Dashboard saves rewrite `config.yaml`.** Comments and formatting are lost, and the whole
+  file is replaced, so if two browser tabs edit at the same time, the last save wins. Keep a copy
+  if you hand-annotate the file.
+- `logging.level` and `logging.capture_bodies` are not applied yet, and changes to
+  `retention_days` take effect after a restart.
+- Failed requests are logged without the provider/account they last tried.
+- Gemini `:countTokens` is not implemented, and Gemini clients need an alias rather than the
+  `provider/model` form.
+- All format and failover testing used mock upstreams. Real providers' SSE quirks are covered
+  only by the translators' unit tests.
+
+## Development
 
 ```bash
-make test     # go vet + go test -race ./...
-make bench    # benchmark translator, SSE, overhead proxy
-cd web && npm run dev   # dashboard dev server, proxy tới :8317
+make test               # go vet + go test -race ./...
+make bench              # translator, SSE and proxy-overhead benchmarks
+cd web && npm run dev   # dashboard dev server, proxies API calls to :8317
 ```
 
-Cấu trúc: `internal/proxy` (data plane) · `internal/router` (định tuyến, cooldown, affinity) ·
-`internal/translate/*` (codec từng định dạng) · `internal/ir` · `internal/sse` ·
-`internal/upstream` (HTTP client, phân loại lỗi) · `internal/auth` (OAuth) ·
-`internal/store` (SQLite) · `internal/server` (route, admin API) · `web/` (dashboard React).
+Project layout:
+
+| Path | Contents |
+|---|---|
+| `cmd/clirouter` | Entry point, flags, first-run config |
+| `internal/proxy` | Data plane: attempts, failover, keepalive, stream writer |
+| `internal/router` | Model resolution, account selection, cooldowns, affinity |
+| `internal/translate/*` | Codecs for anthropic, openai (chat), responses and gemini |
+| `internal/ir` | Typed intermediate representation |
+| `internal/sse` | Fast SSE reader |
+| `internal/upstream` | HTTP client pools, error classification |
+| `internal/auth` | OAuth flows and the encrypted token store |
+| `internal/store` | SQLite request log and stats |
+| `internal/server` | Routes, admin API, security middleware |
+| `internal/config` | Config schema, defaults, validation, hot reload |
+| `web/` | React + TypeScript dashboard (Vite), embedded into the binary |
 
 ## License
 

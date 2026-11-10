@@ -1,41 +1,36 @@
-# Chính sách bảo mật / Security policy
+# Security policy
 
-## Báo lỗ hổng
+## Reporting a vulnerability
 
-**Đừng mở issue công khai** cho lỗ hổng bảo mật.
+**Please do not open a public issue** for security problems.
 
-Hãy báo riêng qua GitHub: tab **Security → Report a vulnerability**
+Report privately through GitHub: **Security → Report a vulnerability**
 (<https://github.com/Project-by-Myself/clirouter/security/advisories/new>).
 
-Nên kèm:
+Please include:
 
-- phiên bản / commit, hệ điều hành, cách chạy (bind address, có `admin_password` / `api_keys` không);
-- các bước tái hiện hoặc PoC tối thiểu;
-- ảnh hưởng (lộ key provider, chiếm admin API, DoS, ...).
+- version / commit, OS, and how you run it (bind address, whether `admin_password` / `api_keys` are set);
+- steps to reproduce or a minimal PoC;
+- impact (provider key disclosure, admin API takeover, DoS, …).
 
-**Không gửi API key, token OAuth hay file `config.yaml` thật.** Dùng key giả.
+**Never send real API keys, OAuth tokens or a real `config.yaml`.** Use fake keys.
 
-Chúng tôi sẽ phản hồi trong vòng 7 ngày, thống nhất mốc công bố với bạn (mặc định tối đa 90 ngày)
-và ghi công trong release note nếu bạn muốn.
+We aim to respond within 7 days, agree on a disclosure date with you (90 days at most by default),
+and credit you in the release notes if you wish.
 
-## Phạm vi
+## Scope
 
-Trong phạm vi: binary `clirouter`, admin API `/admin/api/*`, dashboard nhúng, xử lý và lưu trữ
-key/token, luồng đăng nhập OAuth.
+In scope: the `clirouter` binary, the admin API `/admin/api/*`, the embedded dashboard, storage and
+handling of keys/tokens, and the OAuth login flows.
 
-Ngoài phạm vi:
+Out of scope:
 
-- kẻ tấn công đã đọc/ghi được `~/.clirouter` hoặc chạy code với quyền user của bạn;
-- người có `admin_password` (admin được tin cậy: có thể đổi `base_url` provider);
-- OAuth client ID/secret trong `internal/auth/endpoints.go` — đó là giá trị **công khai** của các
-  ứng dụng cài đặt (gemini-cli, Copilot, Claude), không phải bí mật;
-- việc provider từ chối/khoá tài khoản do dùng subscription qua proxy.
+- an attacker who can already read/write `~/.clirouter` or run code as your user;
+- anyone holding `admin_password` (admins are trusted: they can change a provider's `base_url`);
+- the OAuth client IDs/secrets in `internal/auth/endpoints.go` — these are the **public** values of
+  installed applications (gemini-cli, Copilot, Claude), not secrets;
+- a provider rejecting or suspending an account because a subscription is used through a proxy.
 
-## Phiên bản được hỗ trợ
+## Supported versions
 
-Chỉ nhánh `main` / bản phát hành mới nhất nhận bản vá bảo mật.
-
----
-
-To report a vulnerability, use GitHub private vulnerability reporting (Security → Report a
-vulnerability). Do not open a public issue and do not include real credentials.
+Only `main` / the latest release receives security fixes.

@@ -6,7 +6,7 @@ import { Icon } from "../icons";
 import { attachAccount, OAUTH_LABEL, OAuthFlow } from "../oauth";
 import { useConfig } from "../store";
 import { OAUTH_PROVIDER_TYPE, type OAuthAccount } from "../types";
-import { Badge, Empty, ErrorNote, useConfirm, useToast } from "../ui";
+import { Badge, ErrorNote, useConfirm, useToast } from "../ui";
 import { clone, fmtAgo, fmtCountdown, fmtDateTime } from "../util";
 
 const TYPES = ["claude", "codex", "copilot", "gemini-cli"];
@@ -60,7 +60,7 @@ export default function OAuthAccounts() {
   };
 
   return (
-    <section className="card" aria-labelledby="oauth-h" style={{ marginBottom: 16 }}>
+    <section className="card" aria-labelledby="oauth-h">
       <div className="card-head" style={{ flexWrap: "wrap" }}>
         <h2 id="oauth-h" className="grow">
           {t("oauth.title")}
@@ -100,7 +100,14 @@ export default function OAuthAccounts() {
           <ErrorNote error={error} />
         </div>
       ) : data && data.length === 0 ? (
-        !login && <Empty icon="key" title={t("oauth.emptyTitle")} body={t("oauth.emptyBody")} />
+        !login && (
+          <div className="card-body row" style={{ gap: 12 }}>
+            <Icon name="key" size={16} className="faint" />
+            <div className="grow small">
+              <strong>{t("oauth.emptyTitle")}</strong> <span className="muted">— {t("oauth.emptyBody")}</span>
+            </div>
+          </div>
+        )
       ) : data ? (
         <div className="table-wrap">
           <table className="tbl">

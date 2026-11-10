@@ -18,8 +18,16 @@ function format(s: string, vars?: Record<string, string | number>): string {
   return s.replace(/\{(\w+)\}/g, (m, k: string) => (k in vars ? String(vars[k]) : m));
 }
 
+function defaultLang(): Lang {
+  try {
+    return (navigator.languages || [navigator.language]).some((l) => l?.toLowerCase().startsWith("vi")) ? "vi" : "en";
+  } catch {
+    return "en";
+  }
+}
+
 export function LangProvider({ children }: { children: ReactNode }) {
-  const [lang, setLang] = useStored<Lang>("clr.lang", "vi");
+  const [lang, setLang] = useStored<Lang>("clr.lang", defaultLang());
   const t = useCallback<TFn>((k, vars) => format((lang === "en" ? en : vi)[k] ?? k, vars), [lang]);
   useEffect(() => {
     document.documentElement.lang = lang;

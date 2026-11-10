@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState, type FormEvent } from "react";
+import { Fragment, lazy, Suspense, useEffect, useState, type FormEvent } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { getAuthState, getPassword, onAuthState, setPassword, type AuthState } from "./api";
 import type { Key } from "./dict";
@@ -6,8 +6,8 @@ import { useStored } from "./hooks";
 import { useI18n } from "./i18n";
 import { Icon, type IconName } from "./icons";
 import { ConfigProvider, StatusProvider, useStatus } from "./store";
-import { ConfirmProvider, ErrorBoundary, ToastProvider } from "./ui";
-import { fmtUptime } from "./util";
+import { ConfirmProvider, CopyButton, ErrorBoundary, ToastProvider } from "./ui";
+import { endpointURL, fmtUptime } from "./util";
 import Overview from "./pages/Overview";
 
 const Providers = lazy(() => import("./pages/Providers"));
@@ -18,15 +18,16 @@ const Integrations = lazy(() => import("./pages/Integrations"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Playground = lazy(() => import("./pages/Playground"));
 
-const NAV: { to: string; key: Key; icon: IconName }[] = [
-  { to: "/", key: "nav.overview", icon: "overview" },
-  { to: "/providers", key: "nav.providers", icon: "providers" },
-  { to: "/accounts", key: "nav.accounts", icon: "accounts" },
-  { to: "/combos", key: "nav.combos", icon: "combos" },
-  { to: "/requests", key: "nav.requests", icon: "requests" },
-  { to: "/integrations", key: "nav.integrations", icon: "integrations" },
-  { to: "/settings", key: "nav.settings", icon: "settings" },
-  { to: "/playground", key: "nav.playground", icon: "playground" },
+// Order defines the 1–8 keyboard shortcuts; groups are visual only.
+const NAV: { to: string; key: Key; icon: IconName; group: Key }[] = [
+  { to: "/", key: "nav.overview", icon: "overview", group: "navg.monitor" },
+  { to: "/requests", key: "nav.requests", icon: "requests", group: "navg.monitor" },
+  { to: "/providers", key: "nav.providers", icon: "providers", group: "navg.routing" },
+  { to: "/accounts", key: "nav.accounts", icon: "accounts", group: "navg.routing" },
+  { to: "/combos", key: "nav.combos", icon: "combos", group: "navg.routing" },
+  { to: "/integrations", key: "nav.integrations", icon: "integrations", group: "navg.connect" },
+  { to: "/playground", key: "nav.playground", icon: "playground", group: "navg.connect" },
+  { to: "/settings", key: "nav.settings", icon: "settings", group: "navg.system" },
 ];
 
 type Theme = "system" | "light" | "dark";
@@ -110,21 +111,25 @@ function Shell() {
       <aside className={`sidebar ${menu ? "open" : ""}`} aria-label={t("a11y.nav")}>
         <div className="brand">
           <span className="brand-logo">
-            <Icon name="logo" size={14} strokeWidth={2.6} />
+            <Icon name="logo" size={15} strokeWidth={2.6} />
           </span>
           clirouter
         </div>
         <nav className="nav">
           {NAV.map((n, i) => (
-            <NavLink key={n.to} to={n.to} end={n.to === "/"}>
-              <Icon name={n.icon} />
-              <span>{t(n.key)}</span>
-              <kbd className="hide-sm">{i + 1}</kbd>
-            </NavLink>
+            <Fragment key={n.to}>
+              {(i === 0 || NAV[i - 1].group !== n.group) && <div className="nav-group">{t(n.group)}</div>}
+              <NavLink to={n.to} end={n.to === "/"}>
+                <Icon name={n.icon} />
+                <span>{t(n.key)}</span>
+                <kbd className="hide-sm">{i + 1}</kbd>
+              </NavLink>
+            </Fragment>
           ))}
         </nav>
         <div className="sidebar-foot">
-          <div>
+          <EndpointCard />
+          <div className="kbd-hint hide-sm">
             <kbd>1</kbd>–<kbd>8</kbd> {t("shell.kbdNav")} · <kbd>t</kbd> {t("shell.kbdTheme")} · <kbd>l</kbd> {t("shell.kbdLang")}
           </div>
         </div>
@@ -134,7 +139,11 @@ function Shell() {
           <button className="btn ghost icon menu-btn" aria-label={t("a11y.menu")} aria-expanded={menu} onClick={() => setMenu((m) => !m)}>
             <Icon name="menu" />
           </button>
-          <span className="title ellipsis">{cur ? t(cur.key) : ""}</span>
+          <span className="crumbs ellipsis">
+            <span className="hide-sm">clirouter</span>
+            <Icon name="right" size={13} className="hide-sm" />
+            <strong>{cur ? t(cur.key) : ""}</strong>
+          </span>
           <span className="spacer" />
           <StatusPill />
           <button className="btn ghost sm" onClick={() => setLang(lang === "vi" ? "en" : "vi")} aria-label={t("shell.lang")} title={t("shell.lang")}>
@@ -162,6 +171,25 @@ function Shell() {
             </Suspense>
           </ErrorBoundary>
         </main>
+      </div>
+    </div>
+  );
+}
+
+function EndpointCard() {
+  const { t } = useI18n();
+  const { status } = useStatus();
+  if (!status) return null;
+  const url = endpointURL(status.listen);
+  return (
+    <div className="endpoint-card">
+      <div className="ep-label">
+        <Icon name="integrations" size={12} />
+        {t("shell.endpoint")}
+      </div>
+      <div className="ep-url">
+        <code title={url}>{url}</code>
+        <CopyButton text={url} label={t("common.copy")} className="btn ghost icon xs" iconOnly />
       </div>
     </div>
   );
@@ -220,7 +248,7 @@ function PasswordScreen({ onDone }: { onDone: () => void }) {
       <form className="card auth-card stack" onSubmit={submit}>
         <div className="row">
           <span className="brand-logo">
-            <Icon name="lock" size={13} style={{ color: "var(--bg)" }} />
+            <Icon name="lock" size={14} />
           </span>
           <h1>{t("auth.title")}</h1>
         </div>

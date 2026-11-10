@@ -78,7 +78,6 @@ function validate(f: Form, cfg: Config, t: TFn): Errors {
   if (mm) e.model_map = mm;
   const hh = rowsError(f.headers, t);
   if (hh) e.headers = hh;
-  if (f.origId && id && id !== f.origId && f.keys.some(isMasked)) e.keys = t("prov.renameKeys");
   return e;
 }
 
@@ -173,26 +172,42 @@ export default function Providers() {
   );
 }
 
+const TYPE_COLOR: Record<string, string> = {
+  anthropic: "#c96442",
+  "claude-oauth": "#b4532f",
+  openai: "#10a37f",
+  codex: "#0f766e",
+  "openai-compatible": "#5046e5",
+  gemini: "#2f6fe4",
+  "gemini-cli": "#1a5fd0",
+  vertex: "#188038",
+  copilot: "#6e40c9",
+};
+
+function ProviderAvatar({ p }: { p: Provider }) {
+  const letters = p.id.replace(/[^a-z0-9]/gi, "").slice(0, 2) || "?";
+  return (
+    <span className="prov-avatar" style={{ background: TYPE_COLOR[p.type] || "#64748b" }} aria-hidden="true">
+      {letters}
+    </span>
+  );
+}
+
 function ProviderCard({ p, onEdit, onToggle, onDelete }: { p: Provider; onEdit: () => void; onToggle: () => void; onDelete: () => void }) {
   const t = useT();
   const shown = p.models.slice(0, 6);
   const mapped = Object.keys(p.model_map);
   return (
     <div className={`card prov-card ${p.disabled ? "disabled" : ""}`}>
-      <div className="row">
+      <div className="row" style={{ gap: 12 }}>
+        <ProviderAvatar p={p} />
         <div className="grow" style={{ minWidth: 0 }}>
-          <div className="row">
-            <h2 className="ellipsis mono" style={{ fontSize: 14 }}>
-              {p.id}
-            </h2>
+          <h2 className="ellipsis mono" style={{ fontSize: 14 }}>
+            {p.id}
+          </h2>
+          <div className="row" style={{ gap: 6, marginTop: 3 }}>
             <Badge tone="accent">{p.type}</Badge>
-            {p.disabled ? (
-              <Badge icon="pause">{t("prov.disabled")}</Badge>
-            ) : (
-              <Badge tone="ok" icon="check">
-                {t("prov.enabled")}
-              </Badge>
-            )}
+            {p.disabled && <Badge icon="pause">{t("prov.disabled")}</Badge>}
           </div>
         </div>
         <Switch checked={!p.disabled} onChange={onToggle} label={<span className="sr-only">{t("prov.enableX", { id: p.id })}</span>} />
@@ -204,7 +219,7 @@ function ProviderCard({ p, onEdit, onToggle, onDelete }: { p: Provider; onEdit: 
         </dd>
         <dt>{t("prov.creds")}</dt>
         <dd>
-          {p.keys.length} {t("prov.keysLc")}
+          {p.keys.length} {p.keys.length === 1 ? t("prov.keyLc") : t("prov.keysLc")}
           {p.oauth.length > 0 && ` · ${p.oauth.length} OAuth`}
           {p.keys.length + p.oauth.length === 0 && (
             <Badge tone="warn" icon="alert">

@@ -156,3 +156,23 @@ export function clone<T>(v: T): T {
 export function isErrStatus(s: number): boolean {
   return s >= 400 && s !== 499;
 }
+
+/** host:port that a client should use to reach this server, derived from `listen`. */
+export function resolveHost(listen: string): string {
+  if (!listen) return window.location.host;
+  let host = listen;
+  let port = "";
+  const m = listen.match(/^(.*):(\d+)$/);
+  if (m) {
+    host = m[1];
+    port = m[2];
+  }
+  host = host.replace(/^\[|\]$/g, "");
+  if (!host || host === "0.0.0.0" || host === "::") host = window.location.hostname || "127.0.0.1";
+  if (host.includes(":")) host = `[${host}]`;
+  return port ? `${host}:${port}` : host;
+}
+
+export function endpointURL(listen: string): string {
+  return `http://${resolveHost(listen)}`;
+}

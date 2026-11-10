@@ -197,7 +197,7 @@ export function Empty({ icon = "inbox", title, body, action }: { icon?: IconName
   );
 }
 
-export function CopyButton({ text, label, className = "btn sm" }: { text: string; label?: string; className?: string }) {
+export function CopyButton({ text, label, className = "btn sm", iconOnly }: { text: string; label?: string; className?: string; iconOnly?: boolean }) {
   const t = useT();
   const [done, setDone] = useState(false);
   return (
@@ -205,6 +205,7 @@ export function CopyButton({ text, label, className = "btn sm" }: { text: string
       type="button"
       className={`${className} copy-btn`}
       aria-label={label || t("common.copy")}
+      title={iconOnly ? (done ? t("common.copied") : label || t("common.copy")) : undefined}
       onClick={async () => {
         if (await copyText(text)) {
           setDone(true);
@@ -213,7 +214,7 @@ export function CopyButton({ text, label, className = "btn sm" }: { text: string
       }}
     >
       <Icon name={done ? "check" : "copy"} size={13} />
-      <span>{done ? t("common.copied") : label || t("common.copy")}</span>
+      {!iconOnly && <span>{done ? t("common.copied") : label || t("common.copy")}</span>}
     </button>
   );
 }
