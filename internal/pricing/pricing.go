@@ -107,7 +107,7 @@ func prefixMatch(tab map[string]config.Price, m string) (config.Price, bool) {
 func (t *Table) Lookup(provider, upModel, reqModel string) (config.Price, bool) {
 	prov := strings.ToLower(provider)
 	if t != nil && len(t.overrides) > 0 {
-		for _, k := range []string{prov + "/" + strings.ToLower(upModel), strings.ToLower(upModel), strings.ToLower(reqModel), prov + "/" + normalize(upModel), normalize(upModel), normalize(reqModel)} {
+		for _, k := range []string{prov + "/" + strings.ToLower(upModel), strings.ToLower(upModel), strings.ToLower(reqModel), prov + "/" + syncName(upModel), syncName(upModel), syncName(reqModel)} {
 			if pr, ok := t.overrides[k]; ok && k != "" && k != prov+"/" {
 				return pr, true
 			}
@@ -115,20 +115,20 @@ func (t *Table) Lookup(provider, upModel, reqModel string) (config.Price, bool) 
 		if pr, ok := t.overrides[prov+"/*"]; ok && prov != "" {
 			return pr, true
 		}
-		for _, m := range []string{normalize(upModel), normalize(reqModel)} {
+		for _, m := range []string{syncName(upModel), syncName(reqModel)} {
 			if pr, ok := prefixMatch(t.overrides, m); ok && m != "" {
 				return pr, true
 			}
 		}
 	}
 	if sy := synced.Load(); sy != nil {
-		for _, m := range []string{normalize(upModel), normalize(reqModel)} {
+		for _, m := range []string{syncName(upModel), syncName(reqModel)} {
 			if pr, ok := sy.Prices[m]; ok && m != "" {
 				return pr, true
 			}
 		}
 	}
-	for _, m := range []string{normalize(upModel), normalize(reqModel)} {
+	for _, m := range []string{syncName(upModel), syncName(reqModel)} {
 		if m == "" {
 			continue
 		}

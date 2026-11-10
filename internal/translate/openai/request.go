@@ -433,13 +433,15 @@ func EncodeRequest(req *ir.Request, opts ir.EncodeOptions) ([]byte, error) {
 	if len(req.ResponseFormat) > 0 && !isNull(req.ResponseFormat) {
 		out.ResponseFormat = req.ResponseFormat
 	}
-	if opts.ProviderType == "openai" {
+	// Azure OpenAI serves the same models and parameters as OpenAI.
+	openaiLike := opts.ProviderType == "openai" || opts.ProviderType == "azure-openai"
+	if openaiLike {
 		out.MaxCompletionTokens = req.MaxTokens
 		out.PromptCacheKey = req.PromptCacheKey
 	} else {
 		out.MaxTokens = req.MaxTokens
 	}
-	if r := req.Reasoning; r != nil && !r.Disabled && (opts.ProviderType == "openai" || opts.ProviderType == "openai-compatible") {
+	if r := req.Reasoning; r != nil && !r.Disabled && (openaiLike || opts.ProviderType == "openai-compatible") {
 		switch {
 		case r.Effort != "":
 			out.ReasoningEffort = r.Effort

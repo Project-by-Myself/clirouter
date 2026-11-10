@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Project-by-Myself/clirouter/internal/cloudauth"
 	"github.com/Project-by-Myself/clirouter/internal/config"
 )
 
@@ -87,6 +88,22 @@ func New(cfg *config.Config, prev *Router, oauth func(providerID, accountID stri
 			}
 			sum := sha256.Sum256([]byte(key))
 			a := &Account{ID: pc.ID + ":" + hex.EncodeToString(sum[:5]), Label: mask(key), Provider: p, apiKey: key}
+			if ref, ok := strings.CutPrefix(key, config.ServiceAccountPrefix); ok && pc.Type == "vertex" {
+				// A service-account key is a file path or env reference, not
+				// a secret; tokens come from the shared OAuth2 JWT flow.
+				a.Label, a.apiKey = key, ""
+				a.OAuth = cloudauth.SharedServiceAccount(ref, pc.Proxy)
+			}
+			if o := old[a.ID]; o != nil {
+				a.st = o.st
+			} else {
+				a.st = newState()
+			}
+			p.Accounts = append(p.Accounts, a)
+		}
+		if len(p.Accounts) == 0 && len(pc.OAuth) == 0 && config.KeyOptional(pc.Type) {
+			// Local servers (ollama) need no key: one keyless account.
+			a := &Account{ID: pc.ID + ":local", Label: "no key", Provider: p}
 			if o := old[a.ID]; o != nil {
 				a.st = o.st
 			} else {
@@ -213,10 +230,10 @@ func typeFamily(t string) string {
 		return "anthropic"
 	case "gemini", "vertex", "gemini-cli":
 		return "gemini"
-	case "openai", "codex":
+	case "openai", "codex", "azure-openai":
 		return "openai"
 	}
-	return "other"
+	return "other" // openai-compatible, ollama, bedrock (model ids are provider-specific)
 }
 
 // Pick chooses an account of t's provider. When every account is cooling

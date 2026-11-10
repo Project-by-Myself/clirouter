@@ -9,7 +9,7 @@ import (
 
 func TestLookupNormalizes(t *testing.T) {
 	tab := New(nil)
-	for _, m := range []string{"claude-sonnet-4-5-20250929", "anthropic/claude-sonnet-4-5", "claude-sonnet-4-5@20250929", "Claude-Sonnet-4-5"} {
+	for _, m := range []string{"claude-sonnet-4-5-20250929", "anthropic/claude-sonnet-4-5", "claude-sonnet-4-5@20250929", "Claude-Sonnet-4-5", "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "anthropic.claude-sonnet-4-5-20250929-v1:0"} {
 		if pr, ok := tab.Lookup("x", m, ""); !ok || pr.Input != 3 {
 			t.Errorf("%s: %+v %v", m, pr, ok)
 		}

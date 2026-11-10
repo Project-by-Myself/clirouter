@@ -14,6 +14,9 @@ var patterns = regexp.MustCompile(`(?i)` +
 	`|\bgh[pousr]_[A-Za-z0-9]{20,}` + // GitHub tokens
 	`|\bgithub_pat_[A-Za-z0-9_]{20,}` +
 	`|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+` + // JWTs
+	`|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b` + // AWS access key ids
+	`|\bABSK[A-Za-z0-9+/=]{20,}` + // Amazon Bedrock API keys
+	`|-----BEGIN [A-Z ]*PRIVATE KEY-----[^-]*(?:-----END [A-Z ]*PRIVATE KEY-----)?` + // PEM private keys
 	`|((?:api[_-]?key|access_token|refresh_token|key)=)[^&\s"']{8,}`) // query strings
 
 // String replaces anything that looks like a credential with "[REDACTED]".

@@ -298,7 +298,10 @@ key **name**, so renaming a key starts its counters from zero.
 | `openai` | `https://api.openai.com/v1` | API key |
 | `openai-compatible` | *(required)* | API key |
 | `gemini` | `https://generativelanguage.googleapis.com` | API key |
-| `vertex` | `https://aiplatform.googleapis.com` | API key |
+| `vertex` | `https://aiplatform.googleapis.com` | API key (express mode, Gemini only) or service account (`sa:`) |
+| `azure-openai` | *(required)* `https://<resource>.openai.azure.com` | API key, sent as `api-key` |
+| `bedrock` | *(required)* `https://bedrock-runtime.<region>.amazonaws.com` | Bedrock API key, or IAM credentials (`aws:`, SigV4) |
+| `ollama` | `http://127.0.0.1:11434/v1` | None (a key is optional) |
 | `codex` | `https://chatgpt.com/backend-api/codex` | OAuth (ChatGPT) |
 | `claude-oauth` | `https://api.anthropic.com` | OAuth (Claude) |
 | `copilot` | `https://api.githubcopilot.com` | OAuth (GitHub device flow) |
@@ -309,6 +312,51 @@ Each provider can also set `headers`, an outbound `proxy`, `disabled: true`, and
 restart. A one-off `--listen` flag applies to that run only and is never written back to the
 file. If a hand-edited file is invalid, the last good config keeps running and the error is
 logged.
+
+**Cloud and local providers**
+
+```yaml
+providers:
+  # Azure OpenAI (v1 API: /openai/v1/chat/completions and /responses). The model sent
+  # is the deployment name; map client model names to deployments.
+  - id: azure
+    type: azure-openai
+    base_url: https://my-resource.openai.azure.com   # or https://<name>.cognitiveservices.azure.com
+    keys: [env:AZURE_OPENAI_API_KEY]
+    model_map: { gpt-5: my-gpt5-deployment }
+
+  # Ollama on this machine: no key needed, OpenAI chat format.
+  - id: local
+    type: ollama                       # base_url defaults to http://127.0.0.1:11434/v1
+    models: [qwen3-coder, llama3.3]
+
+  # Claude on Amazon Bedrock. The region comes from the host (or set `region:`).
+  - id: bedrock
+    type: bedrock
+    base_url: https://bedrock-runtime.us-east-1.amazonaws.com
+    keys:
+      - env:AWS_BEARER_TOKEN_BEDROCK                  # Bedrock API key (Bearer)
+      - aws:env                                       # IAM: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+      - env:BEDROCK_IAM                               # IAM inline: aws:<ACCESS_KEY_ID>:<SECRET>[:<SESSION_TOKEN>]
+    model_map: { claude-sonnet-4-5: us.anthropic.claude-sonnet-4-5-20250929-v1:0 }
+
+  # Vertex AI with a service account: Gemini and Claude models.
+  - id: vertex
+    type: vertex
+    region: us-east5                   # location; default: from a <location>-aiplatform host, else global
+    project: my-gcp-project            # optional; default: project_id in the key file
+    keys: [sa:~/.config/gcloud/clirouter-sa.json]     # or sa:env:GOOGLE_SA_JSON (the JSON itself)
+    models: [gemini-2.5-pro]
+    model_map: { claude-sonnet-4-5: claude-sonnet-4-5@20250929 }
+```
+
+Bedrock and Vertex Claude models are reached through the Anthropic format, so Anthropic clients
+get passthrough and other clients are translated. IAM credentials are signed with SigV4 and
+service-account tokens (OAuth2 JWT bearer, `cloud-platform` scope) are cached until a minute
+before expiry. Once the project is known (from the service account or `project:`), Vertex URLs
+use `/v1/projects/<project>/locations/<region>/…`, and a regional `region` turns the default host
+into `https://<region>-aiplatform.googleapis.com`. Anthropic `anthropic-beta` headers are
+not forwarded to Bedrock.
 
 ## API reference
 
@@ -462,8 +510,9 @@ These are deliberately left out:
   tokens only from Claude Code, Codex may require its official `instructions`, and Copilot may
   reject a non-VS Code `Editor-Version`. Using a subscription through a proxy may also violate
   the provider's terms; your call.
-- Not supported yet: Cursor/Kiro as upstreams, Codex WebSocket transport, and Vertex service
-  accounts.
+- Not supported yet: Cursor/Kiro as upstreams, Codex WebSocket transport, AWS STS
+  assume-role / instance roles, Azure Entra ID tokens and GCP Application Default Credentials.
+  Bedrock, Azure OpenAI and Vertex were tested against mocks only.
 - **Dashboard saves rewrite `config.yaml`.** Comments and formatting are lost, and the whole
   file is replaced, so if two browser tabs edit at the same time, the last save wins. Keep a copy
   if you hand-annotate the file.

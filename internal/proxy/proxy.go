@@ -385,7 +385,7 @@ type failure struct {
 // a response (success or a mid-stream error that cannot be retried).
 func (c *call) attempt(ctx context.Context, t router.Target, a *router.Account) (*failure, bool) {
 	ptype := t.Provider.Cfg.Type
-	upFmt, pass := upstream.Choose(ptype, c.cf)
+	upFmt, pass := upstream.Choose(ptype, t.Model, c.cf)
 	var body []byte
 	var err error
 	if pass {
@@ -491,7 +491,11 @@ func (c *call) attempt(ctx context.Context, t router.Target, a *router.Account) 
 		}
 
 		c.rec.Provider, c.rec.Account, c.rec.UpstreamModel, c.rec.Passthrough = t.Provider.Cfg.ID, a.ID, t.Model, pass
-		wr := &watchedReader{r: resp.Body, wd: wd, idle: idle}
+		var wr io.Reader = &watchedReader{r: resp.Body, wd: wd, idle: idle}
+		if upstream.IsEventStream(resp) {
+			// Bedrock streams AWS event-stream frames of Anthropic events.
+			wr = upstream.NewBedrockSSE(wr)
+		}
 		var f *failure
 		var done bool
 		switch {
