@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -22,8 +25,12 @@ import (
 
 const sampleConfig = `# clirouter configuration. Edited by hand or from the dashboard.
 listen: 127.0.0.1:8317
-# Client keys. Empty = no auth (fine for localhost only).
+# Client keys. Empty = only requests from this machine are accepted.
+# Keys added from the dashboard are stored as sha256:<hex> digests.
 api_keys: []
+# Admin password for the dashboard / admin API. Empty = admin only from
+# localhost. Generated automatically when listen is not a loopback address.
+# admin_password: env:CLIROUTER_ADMIN_PASSWORD
 #  - {name: me, key: sk-local-change-me}
 timeouts:
   connect: 10s
@@ -80,6 +87,25 @@ func main() {
 	if *listen != "" {
 		cfg.Listen = *listen
 	}
+	fixPerms(log, *path, cfg.DataDir)
+	exposed := !server.IsLoopbackListen(cfg.Listen)
+	if exposed && config.Secret(cfg.AdminPassword) == "" {
+		if cfg.AdminPassword != "" {
+			fatal(log, fmt.Errorf("admin_password refers to %s, which is empty; refusing to expose the admin API on %s", cfg.AdminPassword, cfg.Listen))
+		}
+		pw, err := randomSecret()
+		if err != nil {
+			fatal(log, err)
+		}
+		if err := config.SetTopLevel(*path, "admin_password", pw); err != nil {
+			fatal(log, fmt.Errorf("store generated admin_password: %w", err))
+		}
+		cfg.AdminPassword = pw
+		log.Warn("listening on a non-loopback address: generated a random admin_password for the dashboard; read it from the config file", "config", *path)
+	}
+	if exposed && len(cfg.APIKeys) == 0 {
+		log.Warn("no api_keys configured: the inference API only accepts requests from localhost; add client keys to serve other machines")
+	}
 	st, err := store.Open(cfg.DataDir, cfg.Logging.RetentionDays)
 	if err != nil {
 		fatal(log, fmt.Errorf("open store: %w", err))
@@ -91,6 +117,7 @@ func main() {
 	am.Start(actx)
 	srv := server.New(*path, cfg, st, log, web.Handler(), am.TokenSource)
 	srv.OAuthAdmin = am.AdminHandler()
+	srv.Exposed = exposed
 	stop := make(chan struct{})
 	go srv.Watch(stop)
 
@@ -108,15 +135,62 @@ func main() {
 		}
 	}()
 
-	sig := make(chan os.Signal, 1)
+	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	log.Info("shutting down; waiting for in-flight requests")
+	log.Info("shutting down; waiting up to 30s for in-flight requests (signal again to force)")
 	close(stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_ = hs.Shutdown(ctx)
+	go func() {
+		select {
+		case <-sig:
+			log.Warn("second signal: closing connections now")
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	if err := hs.Shutdown(ctx); err != nil {
+		// Drain deadline passed (long streams): cut the remaining connections
+		// so handlers observe cancellation and record their requests.
+		_ = hs.Close()
+		time.Sleep(200 * time.Millisecond)
+	}
+	acancel()
 	_ = st.Close()
+}
+
+func randomSecret() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// fixPerms tightens permissions of files that hold secrets, in case they
+// were created by hand or by an older version with a looser umask.
+func fixPerms(log *slog.Logger, cfgPath, dataDir string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	tighten := func(p string, mode os.FileMode) {
+		fi, err := os.Stat(p)
+		if err != nil || fi.Mode().Perm()&^mode == 0 {
+			return
+		}
+		if err := os.Chmod(p, mode); err != nil {
+			log.Warn("cannot restrict permissions", "path", p, "err", err)
+			return
+		}
+		log.Warn("restricted permissions (file holds secrets)", "path", p, "from", fi.Mode().Perm(), "to", mode)
+	}
+	tighten(cfgPath, 0o600)
+	tighten(dataDir, 0o700)
+	tighten(filepath.Join(dataDir, "auth"), 0o700)
+	for _, f := range []string{"clirouter.db", "clirouter.db-wal", "clirouter.db-shm"} {
+		tighten(filepath.Join(dataDir, f), 0o600)
+	}
 }
 
 func fatal(log *slog.Logger, err error) {

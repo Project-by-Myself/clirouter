@@ -1,7 +1,6 @@
 package server
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -28,19 +27,39 @@ func (s *Server) adminRoutes(mux *http.ServeMux) {
 	}
 }
 
-// adminAuth: with admin_password set, require "Authorization: Bearer <pw>";
-// without it, only loopback clients may use the admin API.
+// adminAuth guards the admin API (which can read logs, rewrite provider
+// base URLs and so exfiltrate keys):
+//   - browser requests from another origin are always refused (CSRF);
+//   - with admin_password set, "Authorization: Bearer <pw>" is required,
+//     compared in constant time and throttled per IP after failures;
+//   - without it, only direct local requests are allowed: loopback peer,
+//     loopback Host header (DNS rebinding) and no reverse-proxy headers.
 func (s *Server) adminAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if crossOrigin(r) {
+			jsonErr(w, http.StatusForbidden, "cross-origin admin requests are not allowed")
+			return
+		}
 		pw := config.Secret(s.h.Runtime().Cfg.AdminPassword)
 		if pw == "" {
-			if !isLoopback(r) {
-				jsonErr(w, http.StatusForbidden, "admin API is only reachable from localhost unless admin_password is set")
+			if !localRequest(r) {
+				jsonErr(w, http.StatusForbidden, "admin API is only reachable directly from localhost (http://127.0.0.1) unless admin_password is set")
 				return
 			}
 		} else {
-			got, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(pw)) != 1 {
+			ip := clientIP(r)
+			if s.adminFails.blocked(ip) {
+				w.Header().Set("Retry-After", "300")
+				jsonErr(w, http.StatusTooManyRequests, "too many failed login attempts; try again later")
+				return
+			}
+			a := r.Header.Get("Authorization")
+			got := ""
+			if len(a) > 7 && strings.EqualFold(a[:7], "bearer ") {
+				got = strings.TrimSpace(a[7:])
+			}
+			if !config.SecretEqual(got, pw) {
+				s.adminFails.fail(ip)
 				jsonErr(w, http.StatusUnauthorized, "invalid admin password")
 				return
 			}
@@ -103,8 +122,8 @@ func masked(cfg *config.Config) *config.Config {
 			return v
 		}
 		hint := "****"
-		if len(v) > 8 {
-			hint = v[:4] + "…" + v[len(v)-4:]
+		if len(v) >= 16 { // only the last 4 characters, and only of long secrets
+			hint = "…" + v[len(v)-4:]
 		}
 		return keepSecret + ":" + strconv.Itoa(i) + ":" + hint
 	}
@@ -116,8 +135,8 @@ func masked(cfg *config.Config) *config.Config {
 	for i, k := range c.APIKeys {
 		c.APIKeys[i].Key = hide(i, k.Key)
 	}
-	if c.AdminPassword != "" {
-		c.AdminPassword = hide(0, c.AdminPassword)
+	if c.AdminPassword != "" && !strings.HasPrefix(c.AdminPassword, "env:") {
+		c.AdminPassword = keepSecret + ":0:****" // no hint: may be a short, human-chosen password
 	}
 	return &c
 }
@@ -177,8 +196,18 @@ func (s *Server) adminPutConfig(w http.ResponseWriter, r *http.Request) {
 	if next.DataDir == "" {
 		next.DataDir = cur.DataDir
 	}
+	// New client keys are stored hashed; the dashboard shows a key only once.
+	for i, k := range next.APIKeys {
+		if k.Key != "" && !strings.HasPrefix(k.Key, "env:") && !strings.HasPrefix(k.Key, config.HashPrefix) {
+			next.APIKeys[i].Key = config.HashClientKey(k.Key)
+		}
+	}
 	if err := next.Validate(); err != nil {
 		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if s.Exposed && config.Secret(next.AdminPassword) == "" {
+		jsonErr(w, http.StatusBadRequest, "admin_password cannot be removed while clirouter listens on a non-loopback address")
 		return
 	}
 	if err := config.Save(s.path, next); err != nil {

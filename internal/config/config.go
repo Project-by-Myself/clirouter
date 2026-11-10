@@ -3,6 +3,9 @@
 package config
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -29,7 +32,7 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 }
 
 func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(), nil }
-func (d Duration) D() time.Duration         { return time.Duration(d) }
+func (d Duration) D() time.Duration          { return time.Duration(d) }
 
 type Config struct {
 	Listen        string            `yaml:"listen" json:"listen"`
@@ -185,12 +188,87 @@ func Secret(s string) string {
 	return s
 }
 
+// HashPrefix marks a client key stored as a SHA-256 digest instead of the
+// key itself. Client keys are long random strings, so an unsalted digest is
+// enough: the config file no longer holds anything a client could send.
+const HashPrefix = "sha256:"
+
+// HashClientKey returns the stored form of a client key.
+func HashClientKey(k string) string {
+	sum := sha256.Sum256([]byte(k))
+	return HashPrefix + hex.EncodeToString(sum[:])
+}
+
+// SecretEqual compares two secrets in constant time, independent of their
+// lengths (both sides are hashed to fixed-size digests first).
+func SecretEqual(a, b string) bool {
+	ha, hb := sha256.Sum256([]byte(a)), sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1 && a != "" && b != ""
+}
+
+// ClientKeyMatches reports whether the presented key cand matches a
+// configured key (plain, "env:NAME" or "sha256:<hex>").
+func ClientKeyMatches(cand, stored string) bool {
+	if cand == "" {
+		return false
+	}
+	if h, ok := strings.CutPrefix(stored, HashPrefix); ok {
+		want, err := hex.DecodeString(h)
+		if err != nil || len(want) != sha256.Size {
+			return false
+		}
+		got := sha256.Sum256([]byte(cand))
+		return subtle.ConstantTimeCompare(got[:], want) == 1
+	}
+	return SecretEqual(cand, Secret(stored))
+}
+
 // Save writes atomically (temp file + rename) with 0600 permissions.
 func Save(path string, c *Config) error {
 	b, err := yaml.Marshal(c)
 	if err != nil {
 		return err
 	}
+	return writeFile(path, b)
+}
+
+// SetTopLevel sets one top-level scalar key in the YAML file, keeping the
+// rest of the document (including comments) as written.
+func SetTopLevel(path, key, value string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return err
+	}
+	if doc.Kind == 0 {
+		doc = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode, Tag: "!!map"}}}
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("%s: top level is not a mapping", path)
+	}
+	m := doc.Content[0]
+	val := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value}
+	found := false
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content[i+1] = val
+			found = true
+		}
+	}
+	if !found {
+		m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, val)
+	}
+	b, err := yaml.Marshal(&doc)
+	if err != nil {
+		return err
+	}
+	return writeFile(path, b)
+}
+
+func writeFile(path string, b []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.yaml")
 	if err != nil {
 		return err

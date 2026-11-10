@@ -83,11 +83,11 @@ func TestConfigSecretsMaskedAndPreserved(t *testing.T) {
 		t.Fatalf("put: %v %d %s", err, resp.StatusCode, b)
 	}
 	cfg := s.h.Runtime().Cfg
-	if cfg.Routing.Strategy != "fill-first" || cfg.Providers[0].Keys[0] != "sk-ant-secret-123456" || cfg.APIKeys[0].Key != "sk-test" {
+	if cfg.Routing.Strategy != "fill-first" || cfg.Providers[0].Keys[0] != "sk-ant-secret-123456" || cfg.APIKeys[0].Key != config.HashClientKey("sk-test") {
 		t.Fatalf("config after put: %+v %+v", cfg.Routing, cfg.Providers[0].Keys)
 	}
 	saved, _ := os.ReadFile(s.path)
-	if !strings.Contains(string(saved), "sk-ant-secret-123456") || !strings.Contains(string(saved), "fill-first") {
+	if !strings.Contains(string(saved), "sk-ant-secret-123456") || !strings.Contains(string(saved), "fill-first") || strings.Contains(string(saved), "sk-test") {
 		t.Fatalf("file not saved correctly:\n%s", saved)
 	}
 }

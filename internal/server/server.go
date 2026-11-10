@@ -4,7 +4,6 @@
 package server
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -37,10 +36,17 @@ type Server struct {
 	static  http.Handler
 	// OAuthAdmin, when set, serves /admin/api/oauth/ (behind admin auth).
 	OAuthAdmin http.Handler
+	// Exposed is true when the server listens on a non-loopback address; the
+	// admin password can then not be removed from the dashboard.
+	Exposed bool
+
+	adminFails  *failLimiter
+	clientFails *failLimiter
 }
 
 func New(path string, cfg *config.Config, st *store.Store, log *slog.Logger, static http.Handler, oauth func(string, string) router.TokenSource) *Server {
-	s := &Server{path: path, store: st, started: time.Now(), log: log, static: static, oauth: oauth}
+	s := &Server{path: path, store: st, started: time.Now(), log: log, static: static, oauth: oauth,
+		adminFails: newFailLimiter(10, 5*time.Minute), clientFails: newFailLimiter(30, time.Minute)}
 	rt := &proxy.Runtime{Cfg: cfg, Router: router.New(cfg, nil, oauth), Clients: upstream.NewClients(cfg.Timeouts.Connect.D())}
 	s.h = proxy.NewHandler(rt, st)
 	if fi, err := os.Stat(path); err == nil {
@@ -61,7 +67,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("GET /v1beta/models", s.models)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := s.clientAuth(w, r, ir.FormatChat); !ok {
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		s.h.Metrics.WritePrometheus(w)
 	})
@@ -77,38 +86,57 @@ func (s *Server) Handler() http.Handler {
 			s.static.ServeHTTP(w, r)
 		})
 	}
-	return mux
+	return securityHeaders(mux)
 }
 
-// clientAuth returns the key name, or ok=false when keys are configured and
-// none matched.
-func (s *Server) clientAuth(r *http.Request) (string, bool) {
+// clientAuth identifies the client key. With no api_keys configured only
+// local, non-browser-cross-origin requests are served (so a web page cannot
+// spend the user's credits via CSRF or DNS rebinding). On failure it writes
+// the error response in format f and returns ok=false.
+func (s *Server) clientAuth(w http.ResponseWriter, r *http.Request, f ir.Format) (string, bool) {
 	keys := s.h.Runtime().Cfg.APIKeys
 	if len(keys) == 0 {
+		if !localRequest(r) || crossOrigin(r) {
+			writeErr(w, f, http.StatusForbidden, "permission_error", "no api_keys are configured, so clirouter only accepts requests from localhost; add a client key to allow other clients")
+			return "", false
+		}
 		return "local", true
+	}
+	ip := clientIP(r)
+	if s.clientFails.blocked(ip) {
+		w.Header().Set("Retry-After", "60")
+		writeErr(w, f, http.StatusTooManyRequests, "rate_limit_error", "too many failed authentication attempts; try again later")
+		return "", false
 	}
 	cand := []string{r.Header.Get("X-Api-Key"), r.Header.Get("X-Goog-Api-Key"), r.URL.Query().Get("key")}
 	if a := r.Header.Get("Authorization"); len(a) > 7 && strings.EqualFold(a[:7], "bearer ") {
 		cand = append(cand, strings.TrimSpace(a[7:]))
 	}
+	name := ""
 	for _, c := range cand {
 		if c == "" {
 			continue
 		}
+		// No early exit: every key is compared so timing does not reveal
+		// which entry matched.
 		for _, k := range keys {
-			if subtle.ConstantTimeCompare([]byte(c), []byte(config.Secret(k.Key))) == 1 {
-				return k.Name, true
+			if config.ClientKeyMatches(c, k.Key) && name == "" {
+				name = k.Name
 			}
 		}
 	}
-	return "", false
+	if name == "" {
+		s.clientFails.fail(ip)
+		writeErr(w, f, http.StatusUnauthorized, "authentication_error", "invalid or missing API key")
+		return "", false
+	}
+	return name, true
 }
 
 func (s *Server) inference(f ir.Format) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		name, ok := s.clientAuth(r)
+		name, ok := s.clientAuth(w, r, f)
 		if !ok {
-			writeErr(w, f, http.StatusUnauthorized, "authentication_error", "invalid or missing API key")
 			return
 		}
 		s.h.Serve(w, r, f, "", false, name)
@@ -116,9 +144,8 @@ func (s *Server) inference(f ir.Format) http.HandlerFunc {
 }
 
 func (s *Server) gemini(w http.ResponseWriter, r *http.Request) {
-	name, ok := s.clientAuth(r)
+	name, ok := s.clientAuth(w, r, ir.FormatGemini)
 	if !ok {
-		writeErr(w, ir.FormatGemini, http.StatusUnauthorized, "authentication_error", "invalid or missing API key")
 		return
 	}
 	model, method, found := strings.Cut(r.PathValue("action"), ":")
@@ -130,8 +157,7 @@ func (s *Server) gemini(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.clientAuth(r); !ok {
-		writeErr(w, ir.FormatChat, http.StatusUnauthorized, "authentication_error", "invalid or missing API key")
+	if _, ok := s.clientAuth(w, r, ir.FormatChat); !ok {
 		return
 	}
 	type model struct {
@@ -193,8 +219,7 @@ func (s *Server) modelNames() []modelName {
 // countTokens forwards to Anthropic when the model routes there, otherwise
 // returns a cheap estimate (Claude Code only uses it for context display).
 func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.clientAuth(r); !ok {
-		writeErr(w, ir.FormatAnthropic, http.StatusUnauthorized, "authentication_error", "invalid or missing API key")
+	if _, ok := s.clientAuth(w, r, ir.FormatAnthropic); !ok {
 		return
 	}
 	s.h.CountTokens(w, r)
