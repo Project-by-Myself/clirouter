@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"runtime"
@@ -8,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Project-by-Myself/clirouter/internal/config"
 )
 
 // TestConcurrentStreamsNoLeak runs many concurrent streaming requests (some
@@ -30,7 +33,12 @@ func TestConcurrentStreamsNoLeak(t *testing.T) {
 		}
 		sseWrite(w, strings.Join(parts[3:], ""))
 	})
-	s, h := front(t, testCfg(anthropicProvider("a", up.URL, "k1", "k2", "k3")))
+	cfg := testCfg(anthropicProvider("a", up.URL, "k1", "k2", "k3"))
+	// This test is about leaks, not timeouts: 300 concurrent streams under
+	// -race on a shared CI runner can stall longer than testCfg's 400ms.
+	cfg.Timeouts.FirstByte = config.Duration(10 * time.Second)
+	cfg.Timeouts.Idle = config.Duration(10 * time.Second)
+	s, h := front(t, cfg)
 	base := runtime.NumGoroutine()
 	const n = 300
 	var wg sync.WaitGroup
@@ -52,7 +60,11 @@ func TestConcurrentStreamsNoLeak(t *testing.T) {
 			}
 			b, _ := io.ReadAll(resp.Body)
 			if !strings.HasSuffix(string(b), "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") {
-				errs <- "truncated stream"
+				tail := string(b)
+				if len(tail) > 200 {
+					tail = tail[len(tail)-200:]
+				}
+				errs <- fmt.Sprintf("truncated stream (status %d): ...%q", resp.StatusCode, tail)
 			}
 		}(i)
 	}
