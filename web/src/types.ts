@@ -144,6 +144,7 @@ export interface AccountStatus {
   meta?: Record<string, string>;
   quota?: QuotaWindow[];
   quota_at?: string;
+  quota_error?: string;
 }
 
 export interface QuotaWindow {

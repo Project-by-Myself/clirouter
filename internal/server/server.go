@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -38,6 +39,8 @@ type Server struct {
 	static  http.Handler
 	// OAuthAdmin, when set, serves /admin/api/oauth/ (behind admin auth).
 	OAuthAdmin http.Handler
+	// QuotaFetch, when set, fetches subscription usage windows for an OAuth account id.
+	QuotaFetch func(ctx context.Context, accountID string) ([]router.QuotaWindow, error)
 	// Exposed is true when the server listens on a non-loopback address; the
 	// admin password can then not be removed from the dashboard.
 	Exposed bool

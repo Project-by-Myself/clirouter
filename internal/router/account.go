@@ -46,6 +46,7 @@ type state struct {
 	lastUsed   time.Time
 	quota      []QuotaWindow
 	quotaAt    time.Time
+	quotaErr   string
 }
 
 func newState() *state { return &state{modelUntil: map[string]time.Time{}} }
@@ -159,6 +160,7 @@ type AccountStatus struct {
 	Meta          map[string]string `json:"meta,omitempty"`
 	Quota         []QuotaWindow     `json:"quota,omitempty"`
 	QuotaAt       *time.Time        `json:"quota_at,omitempty"`
+	QuotaError    string            `json:"quota_error,omitempty"`
 }
 
 func (a *Account) Status() AccountStatus {
@@ -197,5 +199,6 @@ func (a *Account) Status() AccountStatus {
 		t := s.quotaAt
 		st.QuotaAt = &t
 	}
+	st.QuotaError = s.quotaErr
 	return st
 }

@@ -18,6 +18,41 @@ type QuotaWindow struct {
 	ResetsAt  *time.Time `json:"resets_at,omitempty"`
 }
 
+// SetQuota merges windows fetched from a provider's usage API (same-name
+// windows are replaced, others kept).
+func (a *Account) SetQuota(ws []QuotaWindow, err error) {
+	s := a.st
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil {
+		s.quotaErr = err.Error()
+		return
+	}
+	s.quotaErr = ""
+	s.quota = mergeQuota(s.quota, ws)
+	s.quotaAt = time.Now()
+}
+
+func mergeQuota(old, fresh []QuotaWindow) []QuotaWindow {
+	out := append([]QuotaWindow(nil), fresh...)
+	seen := map[string]bool{}
+	for _, w := range fresh {
+		seen[w.Name] = true
+	}
+	for _, w := range old {
+		if !seen[w.Name] {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// WindowName renders a window length in minutes: 300 → "5h", 10080 → "7d".
+func WindowName(min int64) string { return windowName(min) }
+
+// ParseReset accepts RFC3339, unix seconds, or a duration.
+func ParseReset(v string, now time.Time) (time.Time, bool) { return parseReset(v, now) }
+
 // ObserveQuota records the quota headers of an upstream response. It is
 // cheap when no such headers are present.
 func (a *Account) ObserveQuota(h http.Header) {
@@ -30,7 +65,7 @@ func (a *Account) ObserveQuota(h http.Header) {
 	}
 	s := a.st
 	s.mu.Lock()
-	s.quota, s.quotaAt = ws, time.Now()
+	s.quota, s.quotaAt = mergeQuota(s.quota, ws), time.Now()
 	s.mu.Unlock()
 }
 

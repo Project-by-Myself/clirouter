@@ -35,8 +35,12 @@ formats on the fly. It ships as one Go binary (~13 MB, ~25 MB RAM) with an embed
   model and provider. Daily usage is kept independently of the request-log retention.
 - **Upstream quota tracker.** clirouter reads rate-limit and subscription-window headers
   (Anthropic, OpenAI, Codex 5h/weekly, Claude 5h/7d) and shows the remaining quota and reset
-  time per account. Per-provider spend caps make the router skip a provider once its budget is
+  time per account. For subscription accounts it also polls the providers' usage endpoints
+  every 5 minutes (Claude, Codex, Copilot premium requests, Gemini Code Assist), so the quota
+  shows up before the first request. These endpoints are undocumented and may change. Per-provider spend caps make the router skip a provider once its budget is
   used and fall back to the next target.
+- **Alerts.** Webhook and Telegram notifications when a key or provider crosses 80% / 100% of its
+  budget, a key is about to expire, or an upstream quota window runs low.
 - **Self-service usage.** Key holders can check their own limits and spend at `/me` or via
   `GET /v1/key/info`.
 - **Combos and aliases.** Build one model name out of several targets (`fallback` or
@@ -330,6 +334,7 @@ logged.
 | `GET` · `PUT` | `/admin/api/config` | Read (secrets masked) / replace the whole config; validated, written atomically, hot-reloaded |
 | `GET` | `/admin/api/accounts` | Per key/account health, cooldowns, last error, upstream quota windows |
 | `POST` | `/admin/api/accounts/{id}/reset` | Clear an account's cooldown and error state |
+| `POST` | `/admin/api/accounts/{id}/quota` | Fetch a subscription account's usage windows now |
 | `GET` | `/admin/api/requests?limit&before&provider&model&errors` | Request history (paged) |
 | `GET` | `/admin/api/live?n=100` | Most recent requests, including in-flight |
 | `GET` | `/admin/api/stats?range=1h\|6h\|24h\|7d\|30d` | Totals, timeline, and breakdowns by model/provider/key |

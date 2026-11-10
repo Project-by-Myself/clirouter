@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/Project-by-Myself/clirouter/internal/config"
 	"github.com/Project-by-Myself/clirouter/internal/pricing"
+	"github.com/Project-by-Myself/clirouter/internal/router"
 )
 
 func TestKeyManagementAPI(t *testing.T) {
@@ -169,4 +172,44 @@ func TestPricingSyncEndpoint(t *testing.T) {
 	}
 }
 
-func contextWithCancel() (ctx context.Context, cancel func()) { return context.WithCancel(context.Background()) }
+func contextWithCancel() (ctx context.Context, cancel func()) {
+	return context.WithCancel(context.Background())
+}
+
+type fakeTS struct{}
+
+func (fakeTS) Token() (string, error)  { return "tok", nil }
+func (fakeTS) Refresh() error          { return nil }
+func (fakeTS) Meta() map[string]string { return nil }
+
+func TestRefreshQuotaEndpoint(t *testing.T) {
+	cfg := config.Default()
+	cfg.Providers = []config.Provider{{ID: "claude", Type: "claude-oauth", OAuth: []string{"me@example.com"}}}
+	path := t.TempDir() + "/config.yaml"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	config.Save(path, cfg)
+	s := New(path, cfg, nil, slogDiscard(), nil, func(string, string) router.TokenSource { return fakeTS{} })
+	fail := false
+	s.QuotaFetch = func(ctx context.Context, id string) ([]router.QuotaWindow, error) {
+		if fail {
+			return nil, errors.New("HTTP 401: token sk-ant-oat01-SECRETSECRETSECRETSECRET expired")
+		}
+		u := 61.0
+		return []router.QuotaWindow{{Name: "5h", UsedPct: &u}}, nil
+	}
+	hs := httptest.NewServer(s.Handler())
+	defer hs.Close()
+	c, body, _ := do(t, "POST", hs.URL+"/admin/api/accounts/claude:me@example.com/quota", "")
+	if c != 200 || !strings.Contains(body, `"name":"5h"`) || !strings.Contains(body, `"used_pct":61`) {
+		t.Fatalf("refresh: %d %s", c, body)
+	}
+	fail = true
+	_, body, _ = do(t, "POST", hs.URL+"/admin/api/accounts/claude:me@example.com/quota", "")
+	if !strings.Contains(body, "quota_error") || strings.Contains(body, "SECRETSECRET") || !strings.Contains(body, `"used_pct":61`) {
+		t.Fatalf("error not recorded/redacted or old windows dropped: %s", body)
+	}
+}
+
+func slogDiscard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

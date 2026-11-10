@@ -50,6 +50,20 @@ export default function Accounts() {
     }
   };
 
+  const refreshQuota = async (a: AccountStatus) => {
+    setBusy(a.id);
+    try {
+      const st = await api.refreshQuota(a.id);
+      if (st.quota_error) toast({ kind: "err", title: t("acc.quotaFail"), body: st.quota_error });
+      else toast({ kind: "ok", title: t("acc.quotaOk", { id: a.label || a.id }) });
+      refresh();
+    } catch (e) {
+      toast({ kind: "err", title: t("acc.quotaFail"), body: (e as Error).message });
+    } finally {
+      setBusy(undefined);
+    }
+  };
+
   const toggle = (id: string) =>
     setOpen((s) => {
       const n = new Set(s);
@@ -103,7 +117,7 @@ export default function Accounts() {
       )}
       <div className="stack">
         {groups.map(([prov, accs]) => {
-          const hasQ = accs.some((a) => a.quota && a.quota.length > 0);
+          const hasQ = accs.some((a) => (a.quota && a.quota.length > 0) || a.kind === "oauth");
           return (
           <div className="card" key={prov}>
             <div className="card-head">
@@ -177,6 +191,11 @@ export default function Accounts() {
                           {hasQ && (
                             <td title={a.quota_at ? t("acc.quotaUpdated", { t: fmtAgo(a.quota_at, now) }) : undefined}>
                               {a.quota && a.quota.length ? <QuotaList q={a.quota} now={now} /> : <span className="faint">–</span>}
+                              {a.quota_error && (
+                                <div className="small" style={{ color: "var(--warn)", marginTop: 4 }} title={a.quota_error}>
+                                  <Icon name="alert" size={11} /> {t("acc.quotaErrShort")}
+                                </div>
+                              )}
                             </td>
                           )}
                           <td className="r">{a.inflight}</td>
@@ -198,7 +217,12 @@ export default function Accounts() {
                               <span className="faint">–</span>
                             )}
                           </td>
-                          <td className="r">
+                          <td className="r nowrap">
+                            {a.kind === "oauth" && (
+                              <button className="btn ghost icon sm" style={{ marginRight: 4 }} onClick={() => refreshQuota(a)} disabled={busy === a.id} title={t("acc.quotaRefresh")} aria-label={`${t("acc.quotaRefresh")} ${a.label || a.id}`}>
+                                <Icon name="bolt" size={13} />
+                              </button>
+                            )}
                             <button className="btn sm" onClick={() => reset(a)} disabled={busy === a.id} aria-label={`${t("acc.reset")} ${a.label || a.id}`}>
                               <Icon name="refresh" size={13} /> {t("acc.reset")}
                             </button>

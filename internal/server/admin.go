@@ -22,6 +22,7 @@ func (s *Server) adminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /admin/api/config", a(s.adminPutConfig))
 	mux.HandleFunc("GET /admin/api/accounts", a(s.adminAccounts))
 	mux.HandleFunc("POST /admin/api/accounts/{id}/reset", a(s.adminResetAccount))
+	mux.HandleFunc("POST /admin/api/accounts/{id}/quota", a(s.adminRefreshQuota))
 	mux.HandleFunc("GET /admin/api/requests", a(s.adminRequests))
 	mux.HandleFunc("GET /admin/api/live", a(s.adminLive))
 	mux.HandleFunc("GET /admin/api/stats", a(s.adminStats))

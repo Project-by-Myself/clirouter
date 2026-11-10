@@ -129,12 +129,14 @@ func main() {
 	am.Start(actx)
 	srv := server.New(*path, cfg, st, log, web.Handler(), am.TokenSource)
 	srv.OAuthAdmin = am.AdminHandler()
+	srv.QuotaFetch = am.FetchQuota
 	srv.Exposed = exposed
 	srv.ListenAddr = addr
 	stop := make(chan struct{})
 	go srv.Watch(stop)
 	go srv.RunAlerts(actx)
 	go srv.RunPricingSync(actx)
+	go srv.RunQuotaPoll(actx)
 
 	hs := &http.Server{
 		Addr:              addr,

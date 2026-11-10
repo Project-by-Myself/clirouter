@@ -137,6 +137,7 @@ export const api = {
   config: (s?: AbortSignal) => req<Config>("GET", "/admin/api/config", undefined, s).then(normalizeConfig),
   putConfig: (c: Config) => req<Config>("PUT", "/admin/api/config", c).then(normalizeConfig),
   accounts: (s?: AbortSignal) => req<AccountStatus[]>("GET", "/admin/api/accounts", undefined, s),
+  refreshQuota: (id: string) => req<AccountStatus>("POST", `/admin/api/accounts/${enc(id)}/quota`),
   resetAccount: (id: string) => req<AccountStatus>("POST", `/admin/api/accounts/${enc(id)}/reset`),
   requests: (q: { limit?: number; before?: number; provider?: string; model?: string; errors?: boolean }, s?: AbortSignal) => {
     const p = new URLSearchParams();
