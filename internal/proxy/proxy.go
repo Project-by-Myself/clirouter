@@ -1,0 +1,616 @@
+// Package proxy is the data plane: it runs one client request through
+// routing, upstream attempts with pre-first-byte failover, and streaming.
+package proxy
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+
+	"github.com/Project-by-Myself/clirouter/internal/config"
+	"github.com/Project-by-Myself/clirouter/internal/ir"
+	"github.com/Project-by-Myself/clirouter/internal/router"
+	"github.com/Project-by-Myself/clirouter/internal/sse"
+	"github.com/Project-by-Myself/clirouter/internal/store"
+	"github.com/Project-by-Myself/clirouter/internal/translate"
+	"github.com/Project-by-Myself/clirouter/internal/upstream"
+)
+
+type Runtime struct {
+	Cfg     *config.Config
+	Router  *router.Router
+	Clients *upstream.Clients
+}
+
+type Handler struct {
+	rt      atomic.Pointer[Runtime]
+	Store   *store.Store
+	Metrics *Metrics
+}
+
+func NewHandler(rt *Runtime, st *store.Store) *Handler {
+	h := &Handler{Store: st, Metrics: NewMetrics()}
+	h.rt.Store(rt)
+	return h
+}
+
+func (h *Handler) Runtime() *Runtime     { return h.rt.Load() }
+func (h *Handler) SetRuntime(r *Runtime) { h.rt.Store(r) }
+
+// maxCooldownWait is how long a request may wait for an account whose
+// cooldown is about to expire instead of failing immediately.
+const maxCooldownWait = 5 * time.Second
+
+type call struct {
+	h          *Handler
+	rt         *Runtime
+	r          *http.Request
+	cf         ir.Format
+	codec      *translate.Codec
+	body       []byte
+	model      string
+	stream     bool
+	sessionKey string
+	ireq       *ir.Request
+	out        *clientWriter
+	rec        store.Record
+	start      time.Time
+	usage      ir.Usage
+	errMsg     string
+	clientGone bool
+}
+
+// Serve handles one inference request in client format cf. For Gemini the
+// model and stream flag come from the URL.
+func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, cf ir.Format, urlModel string, urlStream bool, clientKey string) {
+	rt := h.rt.Load()
+	c := &call{h: h, rt: rt, r: r, cf: cf, codec: translate.For(cf), start: time.Now()}
+	c.rec = store.Record{TS: c.start, ClientKey: clientKey, ClientFormat: string(cf)}
+	h.Metrics.inflight.Add(1)
+	defer h.Metrics.inflight.Add(-1)
+
+	body, err := readBody(r, int64(rt.Cfg.Routing.MaxBodyMB)<<20)
+	if err != nil {
+		c.out = newClientWriter(w, c.codec, false)
+		status := http.StatusBadRequest
+		if errors.Is(err, errTooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		c.out.fail(status, "invalid_request_error", err.Error(), 0, nil)
+		c.finish()
+		return
+	}
+	c.body = body
+	if cf == ir.FormatGemini {
+		c.model, c.stream = urlModel, urlStream
+	} else {
+		res := gjson.GetManyBytes(body, "model", "stream")
+		c.model, c.stream = res[0].String(), res[1].Bool()
+	}
+	c.rec.Model, c.rec.Stream = c.model, c.stream
+	c.out = newClientWriter(w, c.codec, c.stream)
+	defer c.out.stop()
+	defer c.finish()
+
+	if c.model == "" {
+		c.out.fail(http.StatusBadRequest, "invalid_request_error", "model is required", 0, nil)
+		return
+	}
+	targets, err := rt.Router.Resolve(c.model)
+	if err != nil {
+		c.out.fail(http.StatusNotFound, "not_found_error", err.Error(), 0, nil)
+		return
+	}
+	if rt.Cfg.Routing.SessionAffinity {
+		c.sessionKey = sessionKey(r, body, cf)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), rt.Cfg.Timeouts.Total.D())
+	defer cancel()
+	if c.stream {
+		c.out.keepalive(rt.Cfg.Timeouts.EarlyPing.D(), rt.Cfg.Timeouts.Keepalive.D())
+	}
+	c.run(ctx, targets)
+}
+
+func (c *call) run(ctx context.Context, targets []router.Target) {
+	maxAttempts := max(c.rt.Cfg.Routing.MaxAttempts, 1)
+	excluded := map[*router.Account]bool{}
+	var last *failure
+	attempts := 0
+	waited := false
+	for {
+		var minWait time.Duration = -1
+	targetsLoop:
+		for _, t := range targets {
+			for attempts < maxAttempts {
+				a, wait := c.rt.Router.Pick(t, c.sessionKey, excluded)
+				if a == nil {
+					if wait > 0 && (minWait < 0 || wait < minWait) {
+						minWait = wait
+					}
+					continue targetsLoop
+				}
+				attempts++
+				c.rec.Attempts = attempts
+				f, done := c.attempt(ctx, t, a)
+				if done {
+					return
+				}
+				if c.clientGone {
+					return
+				}
+				last = f
+				excluded[a] = true
+				switch f.Action {
+				case upstream.Fatal:
+					c.errMsg = f.Message
+					c.out.fail(f.Status, f.Type, f.Message, 0, f.raw)
+					return
+				case upstream.NextTarget:
+					continue targetsLoop
+				}
+			}
+			break
+		}
+		// Every account is cooling down. If one frees up shortly, wait for it
+		// instead of bouncing the agent with a 429.
+		if !waited && last == nil && minWait > 0 && minWait <= maxCooldownWait && attempts < maxAttempts {
+			waited = true
+			select {
+			case <-time.After(minWait + 50*time.Millisecond):
+				continue
+			case <-ctx.Done():
+				c.clientGone = c.r.Context().Err() != nil
+				return
+			}
+		}
+		if last == nil {
+			msg := fmt.Sprintf("all accounts for %q are cooling down", c.model)
+			c.errMsg = msg
+			c.out.fail(http.StatusTooManyRequests, "rate_limit_error", msg, max(minWait, time.Second), nil)
+			return
+		}
+		c.errMsg = last.Message
+		status := last.Status
+		if status == 0 {
+			status = http.StatusBadGateway
+		}
+		c.out.fail(status, last.Type, last.Message, last.RetryAfter, nil)
+		return
+	}
+}
+
+// failure extends upstream.Failure with the raw upstream body for fatal
+// errors in passthrough mode, so the client sees the provider's own error.
+type failure struct {
+	upstream.Failure
+	raw []byte
+}
+
+// attempt runs one upstream call. It returns done=true when the client got
+// a response (success or a mid-stream error that cannot be retried).
+func (c *call) attempt(ctx context.Context, t router.Target, a *router.Account) (*failure, bool) {
+	ptype := t.Provider.Cfg.Type
+	upFmt, pass := upstream.Choose(ptype, c.cf)
+	var body []byte
+	var err error
+	if pass {
+		body = c.body
+		if c.cf != ir.FormatGemini && t.Model != c.model {
+			if body, err = sjson.SetBytes(c.body, "model", t.Model); err != nil {
+				return &failure{Failure: upstream.Failure{Status: 400, Action: upstream.Fatal, Type: "invalid_request_error", Message: "invalid JSON body"}}, false
+			}
+		}
+	} else {
+		if c.ireq == nil {
+			req, err := c.codec.DecodeRequest(c.body)
+			if err != nil {
+				return &failure{Failure: upstream.Failure{Status: 400, Action: upstream.Fatal, Type: "invalid_request_error", Message: "invalid request: " + err.Error()}}, false
+			}
+			if c.cf == ir.FormatGemini {
+				req.Model = c.model
+			}
+			req.Stream = c.stream
+			c.ireq = req
+		}
+		body, err = translate.For(upFmt).EncodeRequest(c.ireq, ir.EncodeOptions{Model: t.Model, ProviderType: ptype})
+		if err != nil {
+			return &failure{Failure: upstream.Failure{Status: 400, Action: upstream.Fatal, Type: "invalid_request_error", Message: "cannot translate request: " + err.Error()}}, false
+		}
+	}
+	upStream := c.stream || !pass
+
+	client, err := c.rt.Clients.Get(t.Provider.Cfg.Proxy)
+	if err != nil {
+		return &failure{Failure: upstream.Failure{Status: 502, Action: upstream.NextTarget, Type: "api_error", Message: err.Error()}}, false
+	}
+	firstByte := c.rt.Cfg.Timeouts.FirstByte.D()
+	if d := t.Provider.Cfg.FirstByte.D(); d > 0 {
+		firstByte = d
+	}
+	idle := c.rt.Cfg.Timeouts.Idle.D()
+	if d := t.Provider.Cfg.Idle.D(); d > 0 {
+		idle = d
+	}
+
+	refreshed := false
+	for {
+		actx, acancel := context.WithCancelCause(ctx)
+		req, err := upstream.Build(actx, a, upFmt, t.Model, body, upStream, c.r.Header)
+		if err != nil {
+			acancel(nil)
+			a.MarkFailure(t.Model, router.FailAuth, 0, err.Error())
+			return &failure{Failure: upstream.Failure{Status: 401, Action: upstream.NextAccount, Type: "authentication_error", Message: err.Error()}}, false
+		}
+		wd := newWatchdog(firstByte, errFirstByte, acancel)
+		a.Begin()
+		resp, err := client.Do(req)
+		if err != nil {
+			wd.stop()
+			a.End()
+			cause := context.Cause(actx)
+			acancel(nil)
+			if c.r.Context().Err() != nil {
+				c.clientGone = true
+				return &failure{}, false
+			}
+			msg := err.Error()
+			status := http.StatusBadGateway
+			if errors.Is(cause, errFirstByte) {
+				msg, status = fmt.Sprintf("%s did not respond within %s", t.Provider.Cfg.ID, firstByte), http.StatusGatewayTimeout
+			} else if ctx.Err() != nil {
+				return &failure{Failure: upstream.Failure{Status: 504, Action: upstream.Fatal, Type: "api_error", Message: "request exceeded total timeout"}}, false
+			}
+			a.MarkFailure(t.Model, router.FailNetwork, 0, msg)
+			return &failure{Failure: upstream.Failure{Status: status, Kind: router.FailNetwork, Action: upstream.NextTarget, Type: "api_error", Message: msg}}, false
+		}
+		if resp.StatusCode >= 400 {
+			wd.stop()
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+			resp.Body.Close()
+			a.End()
+			acancel(nil)
+			f := upstream.Classify(resp.StatusCode, resp.Header, raw, a.OAuth != nil)
+			if f.Action == upstream.RefreshAuth {
+				if !refreshed && a.OAuth.Refresh() == nil {
+					refreshed = true
+					continue
+				}
+				f.Action = upstream.NextAccount
+			}
+			out := &failure{Failure: f}
+			if f.Action == upstream.Fatal {
+				if pass {
+					out.raw = raw
+				}
+			} else {
+				a.MarkFailure(t.Model, f.Kind, f.RetryAfter, f.Message)
+			}
+			return out, false
+		}
+
+		c.rec.Provider, c.rec.Account, c.rec.UpstreamModel, c.rec.Passthrough = t.Provider.Cfg.ID, a.ID, t.Model, pass
+		wr := &watchedReader{r: resp.Body, wd: wd, idle: idle}
+		var f *failure
+		var done bool
+		switch {
+		case pass && !upStream:
+			f, done = c.copyJSON(resp, wr)
+		case pass:
+			f, done = c.pipePassthrough(wr)
+		default:
+			f, done = c.pipeTranslated(wr, upFmt)
+		}
+		wd.stop()
+		cause := context.Cause(actx)
+		resp.Body.Close()
+		a.End()
+		acancel(nil)
+		if c.r.Context().Err() != nil {
+			c.clientGone = true
+			return &failure{}, true
+		}
+		if done {
+			if c.errMsg == "" {
+				a.MarkSuccess(t.Model)
+				c.rt.Router.Bind(c.sessionKey, a)
+			} else {
+				a.MarkFailure(t.Model, router.FailServer, 0, c.errMsg)
+			}
+			return nil, true
+		}
+		if errors.Is(cause, errFirstByte) || errors.Is(cause, errIdle) {
+			f.Message = fmt.Sprintf("%s: %v", t.Provider.Cfg.ID, cause)
+			f.Status = http.StatusGatewayTimeout
+		}
+		a.MarkFailure(t.Model, f.Kind, f.RetryAfter, f.Message)
+		return f, false
+	}
+}
+
+// copyJSON forwards a non-streaming passthrough response.
+func (c *call) copyJSON(resp *http.Response, r io.Reader) (*failure, bool) {
+	b, err := io.ReadAll(io.LimitReader(r, 256<<20))
+	if err != nil {
+		return &failure{Failure: upstream.Failure{Status: 502, Kind: router.FailNetwork, Action: upstream.NextAccount, Type: "api_error", Message: "reading upstream response: " + err.Error()}}, false
+	}
+	if u, ok := c.codec.UsageFromEvent(nil, b); ok {
+		c.usage.Merge(u)
+	}
+	c.out.writeJSON(resp.StatusCode, resp.Header.Get("Content-Type"), b)
+	return nil, true
+}
+
+// pipePassthrough copies upstream events verbatim. It holds back preamble
+// events until real content arrives, so an in-band error at the start can
+// still fail over to another account.
+func (c *call) pipePassthrough(r io.Reader) (*failure, bool) {
+	rd := sse.NewReader(r, 0)
+	codec := c.codec
+	marker := []byte(codec.UsageMarker)
+	var held []byte
+	committed := false
+	for {
+		ev, err := rd.Next()
+		if err != nil {
+			if !committed {
+				return streamBroke(err), false
+			}
+			c.errMsg = "upstream stream ended unexpectedly: " + errText(err)
+			_ = c.out.writeEvents(codec.StreamErrorEvent("api_error", c.errMsg), true)
+			return nil, true
+		}
+		if bytes.Contains(ev.Data, marker) {
+			if u, ok := codec.UsageFromEvent(ev.Name, ev.Data); ok {
+				c.usage.Merge(u)
+			}
+		}
+		if !committed {
+			if typ, msg, ok := codec.IsErrorEvent(ev.Name, ev.Data); ok {
+				return inbandFailure(typ, msg), false
+			}
+			if codec.Preamble(ev.Name, ev.Data) {
+				held = append(held, ev.Raw...)
+				continue
+			}
+			committed = true
+			if len(held) > 0 {
+				held = append(held, ev.Raw...)
+				if c.out.writeEvents(held, rd.Buffered() == 0) != nil {
+					return nil, true
+				}
+				continue
+			}
+		} else if typ, msg, ok := codec.IsErrorEvent(ev.Name, ev.Data); ok {
+			c.errMsg = typ + ": " + msg
+		}
+		terminal := codec.IsTerminal(ev.Name, ev.Data)
+		if c.out.writeEvents(ev.Raw, terminal || rd.Buffered() == 0) != nil {
+			return nil, true
+		}
+		if terminal {
+			return nil, true
+		}
+	}
+}
+
+// pipeTranslated decodes upstream events into IR and re-encodes them for the
+// client (or aggregates them for a non-streaming client).
+func (c *call) pipeTranslated(r io.Reader, upFmt ir.Format) (*failure, bool) {
+	rd := sse.NewReader(r, 0)
+	dec := ir.UnwrapCustomTools(translate.For(upFmt).NewStreamDecoder(), c.ireq)
+	var enc ir.StreamEncoder
+	var agg *ir.Aggregator
+	if c.stream {
+		enc = c.codec.NewStreamEncoder(c.ireq, c.model)
+	} else {
+		agg = ir.NewAggregator()
+	}
+	var buf []byte
+	committed, done, sawFinish := false, false, false
+	var preErr *ir.Event
+	emit := func(ev ir.Event) {
+		if done {
+			return
+		}
+		switch ev.Kind {
+		case ir.EvUsage:
+			c.usage.Merge(ev.Usage)
+		case ir.EvError:
+			if !committed {
+				e := ev
+				preErr = &e
+				return
+			}
+			c.errMsg = ev.Text
+		case ir.EvFinish:
+			sawFinish = true
+		case ir.EvDone:
+			done = true
+		}
+		if ev.Kind != ir.EvStart && ev.Kind != ir.EvUsage {
+			committed = true
+		}
+		if enc != nil {
+			buf = enc.Encode(buf, ev)
+		} else {
+			agg.Add(ev)
+		}
+	}
+	for !done {
+		ev, err := rd.Next()
+		if err != nil {
+			if err == io.EOF && sawFinish {
+				emit(ir.Event{Kind: ir.EvDone})
+				break
+			}
+			if !committed {
+				return streamBroke(err), false
+			}
+			c.errMsg = "upstream stream ended unexpectedly: " + errText(err)
+			emit(ir.Event{Kind: ir.EvError, Text: c.errMsg, ErrType: "api_error"})
+			emit(ir.Event{Kind: ir.EvDone})
+			break
+		}
+		if derr := dec.Decode(ev.Name, ev.Data, emit); derr != nil && !committed {
+			return &failure{Failure: upstream.Failure{Status: 502, Kind: router.FailServer, Action: upstream.NextAccount, Type: "api_error", Message: "bad upstream event: " + derr.Error()}}, false
+		}
+		if preErr != nil {
+			return inbandFailure(preErr.ErrType, preErr.Text), false
+		}
+		if enc != nil && committed && len(buf) > 0 && (done || rd.Buffered() == 0) {
+			if c.out.writeEvents(buf, true) != nil {
+				return nil, true
+			}
+			buf = buf[:0]
+		}
+	}
+	if enc != nil {
+		if len(buf) > 0 {
+			_ = c.out.writeEvents(buf, true)
+		}
+		return nil, true
+	}
+	if agg.ErrMsg != "" && c.errMsg != "" {
+		c.out.fail(http.StatusBadGateway, agg.ErrType, agg.ErrMsg, 0, nil)
+		return nil, true
+	}
+	b, err := c.codec.EncodeResponse(c.ireq, agg.Response())
+	if err != nil {
+		c.errMsg = err.Error()
+		c.out.fail(http.StatusInternalServerError, "api_error", err.Error(), 0, nil)
+		return nil, true
+	}
+	c.out.writeJSON(http.StatusOK, "application/json", b)
+	return nil, true
+}
+
+func streamBroke(err error) *failure {
+	return &failure{Failure: upstream.Failure{Status: 502, Kind: router.FailNetwork, Action: upstream.NextAccount, Type: "api_error", Message: "upstream stream failed before any content: " + errText(err)}}
+}
+
+func inbandFailure(typ, msg string) *failure {
+	f := &failure{Failure: upstream.Failure{Status: 502, Kind: router.FailServer, Action: upstream.NextAccount, Type: typ, Message: msg}}
+	l := strings.ToLower(typ + " " + msg)
+	switch {
+	case strings.Contains(l, "overload"), strings.Contains(l, "capacity"), strings.Contains(l, "unavailable"):
+		f.Status, f.Action = 529, upstream.NextTarget
+	case strings.Contains(l, "rate"), strings.Contains(l, "quota"), strings.Contains(l, "usage limit"):
+		f.Status, f.Kind = 429, router.FailRateLimit
+	case strings.Contains(l, "invalid_request"), strings.Contains(l, "invalid request"):
+		f.Status, f.Action = 400, upstream.Fatal
+	}
+	if f.Type == "" {
+		f.Type = "api_error"
+	}
+	return f
+}
+
+func errText(err error) string {
+	if err == io.EOF {
+		return "connection closed"
+	}
+	return err.Error()
+}
+
+func (c *call) finish() {
+	_, contentSent, status, first := c.out.state()
+	c.rec.DurationMs = time.Since(c.start).Milliseconds()
+	if !first.IsZero() {
+		c.rec.TTFBms = first.Sub(c.start).Milliseconds()
+	}
+	c.rec.Status = status
+	switch {
+	case c.clientGone && !contentSent:
+		c.rec.Status = 499
+		c.rec.Error = "client closed request"
+	case c.errMsg != "":
+		if c.rec.Status < 400 {
+			c.rec.Status = 502
+		}
+		c.rec.Error = c.errMsg
+	}
+	if c.rec.Status == 0 {
+		c.rec.Status = 499
+	}
+	c.rec.InputTokens, c.rec.OutputTokens = c.usage.InputTokens, c.usage.OutputTokens
+	c.rec.CacheRead, c.rec.CacheWrite, c.rec.Reasoning = c.usage.CacheReadTokens, c.usage.CacheWriteTokens, c.usage.ReasoningTokens
+	c.h.Metrics.observe(&c.rec)
+	if c.h.Store != nil {
+		c.h.Store.Add(c.rec)
+	}
+}
+
+var errTooLarge = errors.New("request body too large")
+
+func readBody(r *http.Request, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		limit = 64 << 20
+	}
+	var src io.Reader = r.Body
+	switch strings.ToLower(r.Header.Get("Content-Encoding")) {
+	case "", "identity":
+	case "gzip":
+		gz, err := gzip.NewReader(io.LimitReader(r.Body, limit))
+		if err != nil {
+			return nil, fmt.Errorf("bad gzip body: %w", err)
+		}
+		defer gz.Close()
+		src = gz
+	case "zstd":
+		zr, err := zstd.NewReader(io.LimitReader(r.Body, limit), zstd.WithDecoderMaxMemory(uint64(limit)), zstd.WithDecoderConcurrency(1))
+		if err != nil {
+			return nil, fmt.Errorf("bad zstd body: %w", err)
+		}
+		defer zr.Close()
+		src = zr
+	default:
+		return nil, fmt.Errorf("unsupported Content-Encoding %q", r.Header.Get("Content-Encoding"))
+	}
+	b, err := io.ReadAll(io.LimitReader(src, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, errTooLarge
+	}
+	if len(b) == 0 {
+		return nil, errors.New("empty request body")
+	}
+	return b, nil
+}
+
+// sessionKey identifies a conversation so its turns stick to one account
+// (keeping the provider prompt cache warm). It only reads headers and one or
+// two top-level JSON fields.
+func sessionKey(r *http.Request, body []byte, f ir.Format) string {
+	for _, h := range []string{"X-Claude-Code-Session-Id", "Session_id", "Session-Id", "Conversation_id", "X-Session-Id"} {
+		if v := r.Header.Get(h); v != "" {
+			return v
+		}
+	}
+	var paths []string
+	switch f {
+	case ir.FormatAnthropic:
+		paths = []string{"metadata.user_id"}
+	case ir.FormatResponses, ir.FormatChat:
+		paths = []string{"prompt_cache_key", "user"}
+	}
+	for _, p := range paths {
+		if v := gjson.GetBytes(body, p).String(); v != "" {
+			return v
+		}
+	}
+	return ""
+}
