@@ -3,7 +3,7 @@ import { api, ApiError } from "../api";
 import { useNow, usePoll } from "../hooks";
 import { useT } from "../i18n";
 import { Icon } from "../icons";
-import { attachAccount, OAUTH_LABEL, OAuthFlow } from "../oauth";
+import { attachAccount, OAUTH_LABEL, OAuthFlow, useSubscriptionConsent } from "../oauth";
 import { useConfig } from "../store";
 import { OAUTH_PROVIDER_TYPE, type OAuthAccount } from "../types";
 import { Badge, ErrorNote, useConfirm, useToast } from "../ui";
@@ -12,6 +12,7 @@ import { clone, fmtAgo, fmtCountdown, fmtDateTime } from "../util";
 const TYPES = ["claude", "codex", "copilot", "gemini-cli"];
 
 export default function OAuthAccounts() {
+  const consent = useSubscriptionConsent();
   const t = useT();
   const toast = useToast();
   const confirm = useConfirm();
@@ -82,12 +83,18 @@ export default function OAuthAccounts() {
                 </option>
               ))}
             </select>
-            <button className="btn primary sm" onClick={() => setLogin(true)}>
+            <button className="btn primary sm" onClick={async () => (await consent(type)) && setLogin(true)}>
               <Icon name="lock" size={13} /> {t("oauth.login")}
             </button>
           </div>
         )}
       </div>
+      {!disabled && !login && (
+        <div className="oauth-note small" role="note">
+          <Icon name="alert" size={13} style={{ flex: "none", marginTop: 2 }} />
+          <span>{t("oauth.persistNote")}</span>
+        </div>
+      )}
       {login && (
         <div className="card-body">
           <OAuthFlow oauthType={type} onDone={onDone} onCancel={() => setLogin(false)} />

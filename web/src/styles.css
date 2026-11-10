@@ -531,3 +531,6 @@ details.builtin[open] > summary { margin-bottom: 10px; }
 
 /* Columns hidden where two tables share a row */
 @media (max-width: 1700px) { .split .hide-md { display: none; } }
+
+/* Persistent ToS note on the OAuth accounts card */
+.oauth-note { display: flex; gap: 8px; padding: 10px 18px; background: var(--warn-soft); color: var(--warn); border-bottom: 1px solid color-mix(in srgb, var(--warn) 25%, transparent); }

@@ -4,7 +4,8 @@ import { useT } from "./i18n";
 import { Icon } from "./icons";
 import type { Config, OAuthStart, Provider } from "./types";
 import { OAUTH_PROVIDER_TYPE } from "./types";
-import { CopyButton, ErrorNote } from "./ui";
+import { CopyButton, ErrorNote, useConfirm } from "./ui";
+import type { Key } from "./dict";
 import { clone, copyText } from "./util";
 
 export const OAUTH_LABEL: Record<string, string> = {
@@ -22,6 +23,38 @@ export function OAuthWarning() {
       <span>{t("oauth.warning")}</span>
     </div>
   );
+}
+
+const RISK: Record<string, Key> = {
+  claude: "oauth.riskClaude",
+  codex: "oauth.riskCodex",
+  copilot: "oauth.riskCopilot",
+  "gemini-cli": "oauth.riskGemini",
+};
+
+/**
+ * Asks the admin to acknowledge the terms-of-service risk before logging in
+ * with a personal subscription. Resolves true when they accept.
+ */
+export function useSubscriptionConsent(): (oauthType: string) => Promise<boolean> {
+  const t = useT();
+  const confirm = useConfirm();
+  return (oauthType) =>
+    confirm({
+      title: t("oauth.consentTitle", { x: OAUTH_LABEL[oauthType] || oauthType }),
+      danger: true,
+      confirm: t("oauth.consentOk"),
+      body: (
+        <div className="stack" style={{ marginTop: 0 }}>
+          <p>{t(RISK[oauthType] || "oauth.riskGeneric")}</p>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            <li>{t("oauth.consent1")}</li>
+            <li>{t("oauth.consent2")}</li>
+            <li>{t("oauth.consent3")}</li>
+          </ul>
+        </div>
+      ),
+    });
 }
 
 /** Adds accountId to a provider of the matching type (creating one if needed). */

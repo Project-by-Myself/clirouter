@@ -7,7 +7,7 @@ import { useT, type TFn } from "../i18n";
 import { Icon } from "../icons";
 import { useConfig } from "../store";
 import { BUDGET_PERIODS, bedrockRegion, HINT_TYPES, KEYLESS_TYPES, OAUTH_TYPE_MAP, OAUTH_TYPES, PROVIDER_TYPES, REGION_TYPES, type BudgetPeriod, type Config, type Provider, type ProviderUsage } from "../types";
-import { OAUTH_LABEL, OAuthFlow } from "../oauth";
+import { OAUTH_LABEL, OAuthFlow, useSubscriptionConsent } from "../oauth";
 import { Badge, Drawer, Empty, ErrorNote, Field, Meter, Switch, useConfirm, useToast } from "../ui";
 import { clone, fmtDuration, fmtUsd, isMasked, maskHint, parseDuration } from "../util";
 
@@ -355,6 +355,7 @@ function ProviderDrawer({ form, setForm, config, save, onClose }: { form: Form; 
   const oauthType = OAUTH_TYPE_MAP[form.type];
   const typeHint = HINT_TYPES.has(form.type);
   const [login, setLogin] = useState(false);
+  const consent = useSubscriptionConsent();
   const toast = useToast();
 
   const submit = async (f: Form = form, close = true) => {
@@ -495,7 +496,7 @@ function ProviderDrawer({ form, setForm, config, save, onClose }: { form: Form; 
             <OAuthFlow oauthType={oauthType} onDone={onLoggedIn} onCancel={() => setLogin(false)} />
           ) : (
             <div>
-              <button type="button" className="btn" onClick={() => setLogin(true)}>
+              <button type="button" className="btn" onClick={async () => (await consent(oauthType)) && setLogin(true)}>
                 <Icon name="lock" size={13} /> {t("oauth.loginWith", { x: OAUTH_LABEL[oauthType] || oauthType })}
               </button>
             </div>
