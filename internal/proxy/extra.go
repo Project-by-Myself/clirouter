@@ -20,7 +20,7 @@ func ErrorBody(f ir.Format, status int, typ, msg string) []byte {
 // CountTokens implements POST /v1/messages/count_tokens.
 func (h *Handler) CountTokens(w http.ResponseWriter, r *http.Request) {
 	rt := h.rt.Load()
-	body, err := readBody(r, int64(rt.Cfg.Routing.MaxBodyMB)<<20)
+	body, err := readBody(w, r, int64(rt.Cfg.Routing.MaxBodyMB)<<20)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write(ErrorBody(ir.FormatAnthropic, 400, "invalid_request_error", err.Error()))

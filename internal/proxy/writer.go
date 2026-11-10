@@ -28,6 +28,16 @@ type clientWriter struct {
 	stopOnce    sync.Once
 }
 
+// clientWriteTimeout bounds a single write to the client. A client that
+// stops reading would otherwise block the handler (and its upstream
+// connection) forever, since a full TCP window never errors.
+var clientWriteTimeout = 2 * time.Minute
+
+// armLocked sets the write deadline before a write; must hold c.mu.
+func (c *clientWriter) armLocked() {
+	_ = c.rc.SetWriteDeadline(time.Now().Add(clientWriteTimeout))
+}
+
 func newClientWriter(w http.ResponseWriter, codec *translate.Codec, stream bool) *clientWriter {
 	return &clientWriter{w: w, rc: http.NewResponseController(w), codec: codec, stream: stream, stopc: make(chan struct{})}
 }
@@ -53,6 +63,7 @@ func (c *clientWriter) writeEvents(b []byte, flush bool) error {
 	if !c.headerSent {
 		c.sendStreamHeadersLocked()
 	}
+	c.armLocked()
 	if len(b) > 0 {
 		if _, err := c.w.Write(b); err != nil {
 			c.broken = true
@@ -77,6 +88,7 @@ func (c *clientWriter) flush() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.broken && c.headerSent {
+		c.armLocked()
 		if err := c.rc.Flush(); err != nil {
 			c.broken = true
 		}
@@ -98,6 +110,7 @@ func (c *clientWriter) writeJSON(status int, contentType string, body []byte) {
 	c.w.WriteHeader(status)
 	c.headerSent = true
 	c.status = status
+	c.armLocked()
 	if _, err := c.w.Write(body); err != nil {
 		c.broken = true
 	}
@@ -116,6 +129,7 @@ func (c *clientWriter) fail(status int, errType, msg string, retryAfter time.Dur
 		if c.broken || !c.stream {
 			return
 		}
+		c.armLocked()
 		if _, err := c.w.Write(c.codec.StreamErrorEvent(errType, msg)); err == nil {
 			_ = c.rc.Flush()
 		}
@@ -170,6 +184,7 @@ func (c *clientWriter) keepalive(early, interval time.Duration) {
 }
 
 func (c *clientWriter) writePingLocked(ping []byte) {
+	c.armLocked()
 	if _, err := c.w.Write(ping); err != nil {
 		c.broken = true
 		return
@@ -181,7 +196,17 @@ func (c *clientWriter) writePingLocked(ping []byte) {
 	c.lastWrite = time.Now()
 }
 
-func (c *clientWriter) stop() { c.stopOnce.Do(func() { close(c.stopc) }) }
+// stop ends the keepalive goroutine and clears the write deadline, which is
+// per connection: a stale one would break the next request on a kept-alive
+// connection.
+func (c *clientWriter) stop() {
+	c.stopOnce.Do(func() {
+		close(c.stopc)
+		c.mu.Lock()
+		_ = c.rc.SetWriteDeadline(time.Time{})
+		c.mu.Unlock()
+	})
+}
 
 func (c *clientWriter) state() (headerSent, contentSent bool, status int, first time.Time) {
 	c.mu.Lock()

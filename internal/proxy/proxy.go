@@ -81,7 +81,7 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, cf ir.Format, ur
 	h.Metrics.inflight.Add(1)
 	defer h.Metrics.inflight.Add(-1)
 
-	body, err := readBody(r, int64(rt.Cfg.Routing.MaxBodyMB)<<20)
+	body, err := readBody(w, r, int64(rt.Cfg.Routing.MaxBodyMB)<<20)
 	if err != nil {
 		c.out = newClientWriter(w, c.codec, false)
 		status := http.StatusBadRequest
@@ -90,6 +90,7 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, cf ir.Format, ur
 		}
 		c.out.fail(status, "invalid_request_error", err.Error(), 0, nil)
 		c.finish()
+		c.out.stop()
 		return
 	}
 	c.body = body
@@ -555,9 +556,25 @@ func (c *call) finish() {
 
 var errTooLarge = errors.New("request body too large")
 
-func readBody(r *http.Request, limit int64) ([]byte, error) {
+// bodyReadTimeout bounds how long a client may take to send its request
+// body (slow-body / slowloris). Headers are bounded by ReadHeaderTimeout.
+var bodyReadTimeout = 2 * time.Minute
+
+func readBody(w http.ResponseWriter, r *http.Request, limit int64) (_ []byte, err error) {
 	if limit <= 0 {
 		limit = 64 << 20
+	}
+	// The deadline must be cleared before streaming: net/http's background
+	// read would otherwise hit it and cancel the request mid-response. On
+	// failure it is left in place so net/http's drain of the unread body
+	// cannot hang either; that connection is not reused.
+	rc := http.NewResponseController(w)
+	if rc.SetReadDeadline(time.Now().Add(bodyReadTimeout)) == nil {
+		defer func() {
+			if err == nil {
+				rc.SetReadDeadline(time.Time{})
+			}
+		}()
 	}
 	var src io.Reader = r.Body
 	switch strings.ToLower(r.Header.Get("Content-Encoding")) {
