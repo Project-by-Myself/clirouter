@@ -5,6 +5,38 @@ Một endpoint duy nhất, định tuyến tới Anthropic, OpenAI, Gemini/Verte
 OpenAI-compatible, và tài khoản subscription qua OAuth. Một binary Go (~13 MB, ~25 MB RAM),
 dashboard nhúng sẵn.
 
+![Dashboard clirouter — trang Tổng quan](docs/images/overview.png)
+
+```mermaid
+flowchart LR
+  subgraph C[Coding agent]
+    CC[Claude Code]
+    CX[Codex CLI]
+    CU[Cursor / Cline / opencode]
+    GC[Gemini CLI]
+  end
+  subgraph R[clirouter :8317]
+    direction TB
+    P["Data plane<br/>/v1/messages · /v1/chat/completions<br/>/v1/responses · /v1beta"]
+    RT["Router<br/>alias → combo → provider/model<br/>cooldown · failover · affinity"]
+    TR["Translate qua IR<br/>(passthrough khi cùng định dạng)"]
+    D[("SQLite log<br/>ghi theo lô")]
+    UI["Dashboard + /admin/api"]
+    P --> RT --> TR
+    P -. bất đồng bộ .-> D
+    UI --- D
+  end
+  subgraph U[Upstream]
+    A[Anthropic]
+    O[OpenAI]
+    G[Gemini / Vertex]
+    OC["OpenAI-compatible<br/>(OpenRouter, MiniMax…)"]
+    S["Subscription OAuth<br/>(Codex, Claude, Copilot, Gemini CLI)"]
+  end
+  C --> P
+  TR --> A & O & G & OC & S
+```
+
 ## Chạy nhanh
 
 ```bash
@@ -58,6 +90,19 @@ aliases:
 Loại provider: `anthropic`, `openai`, `openai-compatible`, `gemini`, `vertex`, `codex`,
 `claude-oauth`, `copilot`, `gemini-cli`. Key dạng `env:NAME` đọc từ biến môi trường.
 Config được theo dõi và nạp lại nóng (2 s), không cần restart (trừ `listen`).
+
+## Dashboard
+
+Ảnh chụp với cấu hình demo (provider giả lập chạy local, key giả).
+
+| | |
+|---|---|
+| ![Providers](docs/images/providers.png) | ![Tài khoản](docs/images/accounts.png) |
+| **Providers** — loại, endpoint, số key, model, ưu tiên; bật/tắt nóng. | **Tài khoản** — trạng thái từng key: cooldown theo model, OK/lỗi, lỗi gần nhất. |
+| ![Combo & Alias](docs/images/combos.png) | ![Requests](docs/images/requests.png) |
+| **Combo & Alias** — gom nhiều target thành một tên model (fallback / round-robin). | **Requests** — log từng request: model, provider, TTFB, token, số lần thử. |
+| ![Kết nối](docs/images/integrations.png) | ![Giao diện tối](docs/images/overview-dark.png) |
+| **Kết nối** — snippet cấu hình sẵn cho Claude Code, Codex CLI, Cursor, Gemini CLI, curl. | Giao diện tối, song ngữ Việt / Anh (phím `t`, `l`). |
 
 ## Thiết kế cho ổn định và tốc độ
 
