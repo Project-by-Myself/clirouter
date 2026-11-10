@@ -21,7 +21,9 @@ func Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(r.URL.Path, "/")
 		if p != "" {
-			if _, err := fs.Stat(sub, p); err != nil {
+			// Unknown paths and directories (no listings) fall back to the
+			// SPA. fs.Stat rejects "..", so nothing outside dist is reachable.
+			if fi, err := fs.Stat(sub, strings.TrimSuffix(p, "/")); err != nil || fi.IsDir() {
 				r = r.Clone(r.Context())
 				r.URL.Path = "/"
 			}
