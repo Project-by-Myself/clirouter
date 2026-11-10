@@ -24,6 +24,10 @@ func (s *Server) adminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/live", a(s.adminLive))
 	mux.HandleFunc("GET /admin/api/stats", a(s.adminStats))
 	mux.HandleFunc("GET /admin/api/models", a(s.adminModels))
+	mux.HandleFunc("GET /admin/api/keys/usage", a(s.adminKeysUsage))
+	mux.HandleFunc("GET /admin/api/providers/usage", a(s.adminProvidersUsage))
+	mux.HandleFunc("GET /admin/api/usage", a(s.adminUsage))
+	mux.HandleFunc("GET /admin/api/pricing", a(s.adminPricing))
 	if s.OAuthAdmin != nil {
 		mux.Handle("/admin/api/oauth/", a(s.OAuthAdmin.ServeHTTP))
 	}
@@ -237,6 +241,9 @@ func (s *Server) adminPutConfig(w http.ResponseWriter, r *http.Request) {
 	for i, k := range next.APIKeys {
 		if k.Key != "" && !strings.HasPrefix(k.Key, "env:") && !strings.HasPrefix(k.Key, config.HashPrefix) {
 			next.APIKeys[i].Key = config.HashClientKey(k.Key)
+		}
+		if k.CreatedAt == "" {
+			next.APIKeys[i].CreatedAt = time.Now().Format(time.RFC3339)
 		}
 	}
 	if err := next.Validate(); err != nil {

@@ -20,30 +20,93 @@ import (
 
 	"github.com/Project-by-Myself/clirouter/internal/config"
 	"github.com/Project-by-Myself/clirouter/internal/ir"
+	"github.com/Project-by-Myself/clirouter/internal/pricing"
 	"github.com/Project-by-Myself/clirouter/internal/redact"
 	"github.com/Project-by-Myself/clirouter/internal/router"
 	"github.com/Project-by-Myself/clirouter/internal/sse"
 	"github.com/Project-by-Myself/clirouter/internal/store"
 	"github.com/Project-by-Myself/clirouter/internal/translate"
 	"github.com/Project-by-Myself/clirouter/internal/upstream"
+	"github.com/Project-by-Myself/clirouter/internal/usage"
 )
 
 type Runtime struct {
 	Cfg     *config.Config
 	Router  *router.Router
 	Clients *upstream.Clients
+	Pricing *pricing.Table               // nil: no cost estimates
+	Keys    map[string]*config.ClientKey // client keys by name
+}
+
+// NewRuntime builds the per-config runtime (pricing table and key index).
+func NewRuntime(cfg *config.Config, r *router.Router, clients *upstream.Clients) *Runtime {
+	rt := &Runtime{Cfg: cfg, Router: r, Clients: clients, Pricing: pricing.New(cfg.Pricing), Keys: make(map[string]*config.ClientKey, len(cfg.APIKeys))}
+	for i := range cfg.APIKeys {
+		rt.Keys[cfg.APIKeys[i].Name] = &cfg.APIKeys[i]
+	}
+	return rt
 }
 
 type Handler struct {
 	rt      atomic.Pointer[Runtime]
 	Store   *store.Store
 	Metrics *Metrics
+	Usage   *usage.Tracker
 }
 
 func NewHandler(rt *Runtime, st *store.Store) *Handler {
-	h := &Handler{Store: st, Metrics: NewMetrics()}
+	h := &Handler{Store: st, Metrics: NewMetrics(), Usage: usage.New(nil)}
 	h.rt.Store(rt)
 	return h
+}
+
+// admitErr is a request refused by a client key's policy.
+type admitErr struct {
+	status     int
+	typ, msg   string
+	retryAfter time.Duration
+}
+
+// admit applies the client key's policy (disabled, expiry, allowed models,
+// budget, rpm, concurrency). On success the returned release must be called
+// when the request ends.
+func (h *Handler) admit(rt *Runtime, keyName, model string) (func(), *admitErr) {
+	k := rt.Keys[keyName]
+	if k == nil {
+		return func() {}, nil
+	}
+	if k.Disabled {
+		return nil, &admitErr{status: http.StatusUnauthorized, typ: "authentication_error", msg: fmt.Sprintf("API key %q is disabled", k.Name)}
+	}
+	if exp := k.Expiry(); !exp.IsZero() && time.Now().After(exp) {
+		return nil, &admitErr{status: http.StatusUnauthorized, typ: "authentication_error", msg: fmt.Sprintf("API key %q expired at %s", k.Name, exp.Format(time.RFC3339))}
+	}
+	if !k.AllowsModel(model) {
+		return nil, &admitErr{status: http.StatusForbidden, typ: "permission_error", msg: fmt.Sprintf("model %q is not allowed for API key %q (allowed: %s)", model, k.Name, strings.Join(k.Models, ", "))}
+	}
+	if h.Usage.OverBudget(usage.Key, k.Name, k.BudgetUSD, k.BudgetTokens) {
+		return nil, &admitErr{status: http.StatusPaymentRequired, typ: "billing_error", msg: fmt.Sprintf("API key %q reached its %s budget", k.Name, config.NormPeriod(k.BudgetPeriod))}
+	}
+	release, wait, ok := h.Usage.Acquire(usage.Key, k.Name, k.RPM, k.MaxParallel)
+	if !ok {
+		msg := fmt.Sprintf("API key %q is limited to %d requests per minute", k.Name, k.RPM)
+		if k.MaxParallel > 0 && (k.RPM == 0 || wait <= time.Second) {
+			msg = fmt.Sprintf("API key %q is limited to %d concurrent requests", k.Name, k.MaxParallel)
+		}
+		return nil, &admitErr{status: http.StatusTooManyRequests, typ: "rate_limit_error", msg: msg, retryAfter: wait}
+	}
+	return release, nil
+}
+
+// withinBudget drops targets whose provider has reached its spend cap.
+func (h *Handler) withinBudget(targets []router.Target) []router.Target {
+	out := targets[:0:0]
+	for _, t := range targets {
+		if !h.Usage.OverBudget(usage.Provider, t.Provider.Cfg.ID, t.Provider.Cfg.BudgetUSD, 0) {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func (h *Handler) Runtime() *Runtime     { return h.rt.Load() }
@@ -74,6 +137,7 @@ type call struct {
 	usage      ir.Usage
 	errMsg     string
 	clientGone bool
+	admitted   bool
 }
 
 // Serve handles one inference request in client format cf. For Gemini the
@@ -113,10 +177,27 @@ func (h *Handler) Serve(w http.ResponseWriter, r *http.Request, cf ir.Format, ur
 		c.out.fail(http.StatusBadRequest, "invalid_request_error", "model is required", 0, nil)
 		return
 	}
+	release, aerr := h.admit(rt, clientKey, c.model)
+	if aerr != nil {
+		c.errMsg = aerr.msg
+		c.out.fail(aerr.status, aerr.typ, aerr.msg, aerr.retryAfter, nil)
+		return
+	}
+	defer release()
+	c.admitted = true
 	targets, err := rt.Router.Resolve(c.model)
 	if err != nil {
 		c.out.fail(http.StatusNotFound, "not_found_error", err.Error(), 0, nil)
 		return
+	}
+	if within := h.withinBudget(targets); len(within) < len(targets) {
+		if len(within) == 0 {
+			msg := fmt.Sprintf("every provider for %q has reached its budget", c.model)
+			c.errMsg = msg
+			c.out.fail(http.StatusPaymentRequired, "billing_error", msg, 0, nil)
+			return
+		}
+		targets = within
 	}
 	if rt.Cfg.Routing.SessionAffinity {
 		c.sessionKey = sessionKey(r, body, cf)
@@ -310,6 +391,7 @@ func (c *call) attempt(ctx context.Context, t router.Target, a *router.Account) 
 			a.MarkFailure(t.Model, router.FailNetwork, 0, msg)
 			return &failure{Failure: upstream.Failure{Status: status, Kind: router.FailNetwork, Action: upstream.NextTarget, Type: "api_error", Message: msg}}, false
 		}
+		a.ObserveQuota(resp.Header)
 		if resp.StatusCode >= 400 {
 			wd.stop()
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
@@ -608,6 +690,16 @@ func (c *call) finish() {
 	}
 	c.rec.InputTokens, c.rec.OutputTokens = c.usage.InputTokens, c.usage.OutputTokens
 	c.rec.CacheRead, c.rec.CacheWrite, c.rec.Reasoning = c.usage.CacheReadTokens, c.usage.CacheWriteTokens, c.usage.ReasoningTokens
+	if c.rt.Pricing != nil {
+		c.rec.Cost = c.rt.Pricing.Cost(c.rec.Provider, c.rec.UpstreamModel, c.rec.Model, pricing.Usage{Input: c.rec.InputTokens, Output: c.rec.OutputTokens, CacheRead: c.rec.CacheRead, CacheWrite: c.rec.CacheWrite})
+	}
+	if c.admitted && c.h.Usage != nil {
+		u := usage.Totals{Requests: 1, Input: c.rec.InputTokens, Output: c.rec.OutputTokens, Cost: c.rec.Cost}
+		c.h.Usage.Add(usage.Key, c.rec.ClientKey, u)
+		if c.rec.Provider != "" {
+			c.h.Usage.Add(usage.Provider, c.rec.Provider, u)
+		}
+	}
 	c.h.Metrics.observe(&c.rec)
 	if c.h.Store != nil {
 		c.h.Store.Add(c.rec)

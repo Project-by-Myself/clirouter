@@ -719,3 +719,10 @@ func BenchmarkStreamEncodeText(b *testing.B) {
 		buf = enc.Encode(buf[:0], ev)
 	}
 }
+
+func TestUsageFromNonStreamingResponse(t *testing.T) {
+	u, ok := UsageFromEvent(nil, []byte(`{"id":"resp_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":20,"output_tokens":7}}`))
+	if !ok || u.InputTokens != 20 || u.OutputTokens != 7 {
+		t.Fatalf("got %+v %v", u, ok)
+	}
+}

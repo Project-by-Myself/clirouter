@@ -837,3 +837,10 @@ func BenchmarkStreamDecodeText(b *testing.B) {
 		_ = d.Decode(name, data, emit)
 	}
 }
+
+func TestUsageFromNonStreamingMessage(t *testing.T) {
+	u, ok := UsageFromEvent(nil, []byte(`{"id":"m","type":"message","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":3}}`))
+	if !ok || u.OutputTokens != 5 || u.CacheReadTokens != 3 || u.InputTokens != 13 {
+		t.Fatalf("got %+v %v", u, ok)
+	}
+}

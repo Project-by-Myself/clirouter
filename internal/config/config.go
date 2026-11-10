@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,11 +47,86 @@ type Config struct {
 	Providers     []Provider        `yaml:"providers" json:"providers"`
 	Combos        []Combo           `yaml:"combos,omitempty" json:"combos"`
 	Aliases       map[string]string `yaml:"aliases,omitempty" json:"aliases"`
+	// PublicURL is how clients on other machines reach this server (used in
+	// share messages and the dashboard's setup snippets). Optional.
+	PublicURL string `yaml:"public_url,omitempty" json:"public_url,omitempty"`
+	// Pricing overrides the built-in list prices used for cost estimates.
+	// Keys are "model", "provider/model" or "provider/*".
+	Pricing map[string]Price `yaml:"pricing,omitempty" json:"pricing,omitempty"`
+}
+
+// Price is in USD per 1M tokens. Unset cache prices fall back to Input.
+type Price struct {
+	Input      float64  `yaml:"input" json:"input"`
+	Output     float64  `yaml:"output" json:"output"`
+	CacheRead  *float64 `yaml:"cache_read,omitempty" json:"cache_read,omitempty"`
+	CacheWrite *float64 `yaml:"cache_write,omitempty" json:"cache_write,omitempty"`
+}
+
+// Budget periods. An empty period means monthly.
+const (
+	PeriodDaily   = "daily"
+	PeriodWeekly  = "weekly"
+	PeriodMonthly = "monthly"
+	PeriodTotal   = "total"
+)
+
+// NormPeriod returns p, or monthly when p is empty.
+func NormPeriod(p string) string {
+	if p == "" {
+		return PeriodMonthly
+	}
+	return p
+}
+
+func validPeriod(p string) bool {
+	switch p {
+	case "", PeriodDaily, PeriodWeekly, PeriodMonthly, PeriodTotal:
+		return true
+	}
+	return false
 }
 
 type ClientKey struct {
 	Name string `yaml:"name" json:"name"`
 	Key  string `yaml:"key" json:"key"`
+	Note string `yaml:"note,omitempty" json:"note,omitempty"`
+	// Models limits which model names (as requested by the client) the key
+	// may call. A trailing "*" matches a prefix. Empty allows every model.
+	Models []string `yaml:"models,omitempty" json:"models,omitempty"`
+	// Spending limits per BudgetPeriod; 0 = unlimited. Tokens count input + output.
+	BudgetUSD    float64 `yaml:"budget_usd,omitempty" json:"budget_usd,omitempty"`
+	BudgetTokens int64   `yaml:"budget_tokens,omitempty" json:"budget_tokens,omitempty"`
+	BudgetPeriod string  `yaml:"budget_period,omitempty" json:"budget_period,omitempty"`
+	RPM          int     `yaml:"rpm,omitempty" json:"rpm,omitempty"`                   // requests per minute
+	MaxParallel  int     `yaml:"max_parallel,omitempty" json:"max_parallel,omitempty"` // concurrent requests
+	ExpiresAt    string  `yaml:"expires_at,omitempty" json:"expires_at,omitempty"`     // RFC3339
+	Disabled     bool    `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+	CreatedAt    string  `yaml:"created_at,omitempty" json:"created_at,omitempty"`
+}
+
+// Expiry parses ExpiresAt; the zero time means the key never expires.
+func (k *ClientKey) Expiry() time.Time {
+	t, _ := time.Parse(time.RFC3339, k.ExpiresAt)
+	return t
+}
+
+// AllowsModel reports whether the key may call model.
+func (k *ClientKey) AllowsModel(model string) bool {
+	if len(k.Models) == 0 {
+		return true
+	}
+	m := strings.ToLower(model)
+	for _, p := range k.Models {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "*" || p == m {
+			return true
+		}
+		if pre, ok := strings.CutSuffix(p, "*"); ok && strings.HasPrefix(m, pre) {
+			return true
+		}
+	}
+	return false
 }
 
 type Timeouts struct {
@@ -90,6 +166,10 @@ type Provider struct {
 	// Per-provider overrides; zero means use the global timeout.
 	FirstByte Duration `yaml:"first_byte,omitempty" json:"first_byte"`
 	Idle      Duration `yaml:"idle,omitempty" json:"idle"`
+	// Estimated spend cap per BudgetPeriod; once reached the router skips
+	// this provider and falls back to the next target. 0 = unlimited.
+	BudgetUSD    float64 `yaml:"budget_usd,omitempty" json:"budget_usd,omitempty"`
+	BudgetPeriod string  `yaml:"budget_period,omitempty" json:"budget_period,omitempty"`
 }
 
 type Combo struct {
@@ -200,6 +280,42 @@ func (c *Config) Validate() error {
 		}
 		if p.FirstByte < 0 || p.Idle < 0 {
 			errs = append(errs, fmt.Errorf("provider %q: timeouts must not be negative", p.ID))
+		}
+		if p.BudgetUSD < 0 || !validPeriod(p.BudgetPeriod) {
+			errs = append(errs, fmt.Errorf("provider %q: budget_usd must be >= 0 and budget_period one of daily, weekly, monthly, total", p.ID))
+		}
+	}
+	names := map[string]bool{}
+	for i, k := range c.APIKeys {
+		if k.Name == "" {
+			errs = append(errs, fmt.Errorf("api_keys[%d]: name is required", i))
+			continue
+		}
+		if names[k.Name] {
+			errs = append(errs, fmt.Errorf("api key %q: duplicate name", k.Name))
+		}
+		names[k.Name] = true
+		if k.BudgetUSD < 0 || k.BudgetTokens < 0 || k.RPM < 0 || k.MaxParallel < 0 {
+			errs = append(errs, fmt.Errorf("api key %q: limits must not be negative", k.Name))
+		}
+		if !validPeriod(k.BudgetPeriod) {
+			errs = append(errs, fmt.Errorf("api key %q: budget_period must be daily, weekly, monthly or total", k.Name))
+		}
+		if k.ExpiresAt != "" {
+			if _, err := time.Parse(time.RFC3339, k.ExpiresAt); err != nil {
+				errs = append(errs, fmt.Errorf("api key %q: expires_at must be RFC3339 (e.g. 2026-12-31T23:59:59+07:00)", k.Name))
+			}
+		}
+	}
+	if c.PublicURL != "" {
+		if u, err := url.Parse(c.PublicURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("public_url %q: want http(s)://host[:port]", c.PublicURL))
+		}
+		c.PublicURL = strings.TrimRight(c.PublicURL, "/")
+	}
+	for m, p := range c.Pricing {
+		if p.Input < 0 || p.Output < 0 || (p.CacheRead != nil && *p.CacheRead < 0) || (p.CacheWrite != nil && *p.CacheWrite < 0) {
+			errs = append(errs, fmt.Errorf("pricing %q: prices must not be negative", m))
 		}
 	}
 	for _, cb := range c.Combos {

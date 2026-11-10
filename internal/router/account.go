@@ -44,6 +44,8 @@ type state struct {
 	successes  int64
 	failures   int64
 	lastUsed   time.Time
+	quota      []QuotaWindow
+	quotaAt    time.Time
 }
 
 func newState() *state { return &state{modelUntil: map[string]time.Time{}} }
@@ -155,6 +157,8 @@ type AccountStatus struct {
 	LastErrorAt   *time.Time        `json:"last_error_at,omitempty"`
 	LastUsed      *time.Time        `json:"last_used,omitempty"`
 	Meta          map[string]string `json:"meta,omitempty"`
+	Quota         []QuotaWindow     `json:"quota,omitempty"`
+	QuotaAt       *time.Time        `json:"quota_at,omitempty"`
 }
 
 func (a *Account) Status() AccountStatus {
@@ -187,6 +191,11 @@ func (a *Account) Status() AccountStatus {
 	if !s.lastUsed.IsZero() {
 		t := s.lastUsed
 		st.LastUsed = &t
+	}
+	if len(s.quota) > 0 {
+		st.Quota = append([]QuotaWindow(nil), s.quota...)
+		t := s.quotaAt
+		st.QuotaAt = &t
 	}
 	return st
 }

@@ -37,6 +37,7 @@ type Record struct {
 	CacheRead     int64     `json:"cache_read_tokens"`
 	CacheWrite    int64     `json:"cache_write_tokens"`
 	Reasoning     int64     `json:"reasoning_tokens"`
+	Cost          float64   `json:"cost_usd"`
 	Error         string    `json:"error,omitempty"`
 }
 
@@ -48,6 +49,10 @@ type Store struct {
 	done    chan struct{}
 	wg      sync.WaitGroup
 	retain  time.Duration
+	// needBackfill is set when usage_daily was just created on a database
+	// that may already hold request history.
+	needBackfill  bool
+	backfillMaxID int64
 }
 
 const schema = `
@@ -61,6 +66,19 @@ CREATE TABLE IF NOT EXISTS requests (
   error TEXT
 );
 CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts);
+`
+
+// usage_daily is a rollup kept for usage reports and budgets; unlike the
+// request log it is not pruned by retention_days. day is the local date.
+const usageSchema = `
+CREATE TABLE IF NOT EXISTS usage_daily (
+  day TEXT NOT NULL, client_key TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0,
+  cost REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, client_key, provider, model)
+);
 `
 
 func Open(dir string, retainDays int) (*Store, error) {
@@ -83,10 +101,26 @@ func Open(dir string, retainDays int) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	var hasCost int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name='cost'`).Scan(&hasCost)
+	if hasCost == 0 {
+		if _, err := db.Exec(`ALTER TABLE requests ADD COLUMN cost REAL NOT NULL DEFAULT 0`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate requests.cost: %w", err)
+		}
+	}
+	var hasRollup int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='usage_daily'`).Scan(&hasRollup)
+	var maxID int64
+	_ = db.QueryRow(`SELECT COALESCE(MAX(id),0) FROM requests`).Scan(&maxID)
+	if _, err := db.Exec(usageSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init usage schema: %w", err)
+	}
 	if retainDays <= 0 {
 		retainDays = 14
 	}
-	s := &Store{db: db, ch: make(chan Record, 8192), ring: newRing(1000), done: make(chan struct{}), retain: time.Duration(retainDays) * 24 * time.Hour}
+	s := &Store{db: db, ch: make(chan Record, 8192), ring: newRing(1000), done: make(chan struct{}), retain: time.Duration(retainDays) * 24 * time.Hour, needBackfill: hasRollup == 0 && maxID > 0, backfillMaxID: maxID}
 	s.wg.Add(1)
 	go s.run()
 	return s, nil
@@ -158,20 +192,71 @@ func (s *Store) insert(rs []Record) error {
 	if err != nil {
 		return err
 	}
-	st, err := tx.Prepare(`INSERT INTO requests (ts,client_key,client_format,model,provider,account,upstream_model,status,stream,passthrough,attempts,ttfb_ms,duration_ms,input_tokens,output_tokens,cache_read,cache_write,reasoning,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	st, err := tx.Prepare(`INSERT INTO requests (ts,client_key,client_format,model,provider,account,upstream_model,status,stream,passthrough,attempts,ttfb_ms,duration_ms,input_tokens,output_tokens,cache_read,cache_write,reasoning,cost,error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		tx.Rollback()
 		return err
 	}
+	roll := map[rollKey]*rollVal{}
 	for _, r := range rs {
-		if _, err := st.Exec(r.TS.UnixMilli(), r.ClientKey, r.ClientFormat, r.Model, r.Provider, r.Account, r.UpstreamModel, r.Status, b2i(r.Stream), b2i(r.Passthrough), r.Attempts, r.TTFBms, r.DurationMs, r.InputTokens, r.OutputTokens, r.CacheRead, r.CacheWrite, r.Reasoning, r.Error); err != nil {
+		if _, err := st.Exec(r.TS.UnixMilli(), r.ClientKey, r.ClientFormat, r.Model, r.Provider, r.Account, r.UpstreamModel, r.Status, b2i(r.Stream), b2i(r.Passthrough), r.Attempts, r.TTFBms, r.DurationMs, r.InputTokens, r.OutputTokens, r.CacheRead, r.CacheWrite, r.Reasoning, r.Cost, r.Error); err != nil {
 			st.Close()
 			tx.Rollback()
 			return err
 		}
+		k := rollKey{r.TS.Local().Format(time.DateOnly), r.ClientKey, r.Provider, r.Model}
+		v := roll[k]
+		if v == nil {
+			v = &rollVal{}
+			roll[k] = v
+		}
+		v.add(r)
 	}
 	st.Close()
+	if err := upsertRollup(tx, roll); err != nil {
+		tx.Rollback()
+		return err
+	}
 	return tx.Commit()
+}
+
+type rollKey struct{ day, key, provider, model string }
+
+type rollVal struct {
+	requests, errors, in, out, cr, cw int64
+	cost                              float64
+}
+
+func (v *rollVal) add(r Record) {
+	v.requests++
+	if r.Status >= 400 {
+		v.errors++
+	}
+	v.in += r.InputTokens
+	v.out += r.OutputTokens
+	v.cr += r.CacheRead
+	v.cw += r.CacheWrite
+	v.cost += r.Cost
+}
+
+func upsertRollup(tx *sql.Tx, roll map[rollKey]*rollVal) error {
+	if len(roll) == 0 {
+		return nil
+	}
+	st, err := tx.Prepare(`INSERT INTO usage_daily (day,client_key,provider,model,requests,errors,input_tokens,output_tokens,cache_read,cache_write,cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(day,client_key,provider,model) DO UPDATE SET requests=requests+excluded.requests, errors=errors+excluded.errors,
+input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens,
+cache_read=cache_read+excluded.cache_read, cache_write=cache_write+excluded.cache_write, cost=cost+excluded.cost`)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	for k, v := range roll {
+		if _, err := st.Exec(k.day, k.key, k.provider, k.model, v.requests, v.errors, v.in, v.out, v.cr, v.cw, v.cost); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) prune() {
@@ -214,7 +299,7 @@ func (s *Store) Requests(ctx context.Context, q Query) ([]Record, error) {
 	if q.Errors {
 		where = append(where, "status >= 400")
 	}
-	sqlq := `SELECT id,ts,client_key,client_format,model,provider,account,upstream_model,status,stream,passthrough,attempts,ttfb_ms,duration_ms,input_tokens,output_tokens,cache_read,cache_write,reasoning,error FROM requests`
+	sqlq := `SELECT id,ts,client_key,client_format,model,provider,account,upstream_model,status,stream,passthrough,attempts,ttfb_ms,duration_ms,input_tokens,output_tokens,cache_read,cache_write,reasoning,cost,error FROM requests`
 	if len(where) > 0 {
 		sqlq += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -231,7 +316,7 @@ func (s *Store) Requests(ctx context.Context, q Query) ([]Record, error) {
 		var ts int64
 		var stream, pass int
 		var errs sql.NullString
-		if err := rows.Scan(&r.ID, &ts, &r.ClientKey, &r.ClientFormat, &r.Model, &r.Provider, &r.Account, &r.UpstreamModel, &r.Status, &stream, &pass, &r.Attempts, &r.TTFBms, &r.DurationMs, &r.InputTokens, &r.OutputTokens, &r.CacheRead, &r.CacheWrite, &r.Reasoning, &errs); err != nil {
+		if err := rows.Scan(&r.ID, &ts, &r.ClientKey, &r.ClientFormat, &r.Model, &r.Provider, &r.Account, &r.UpstreamModel, &r.Status, &stream, &pass, &r.Attempts, &r.TTFBms, &r.DurationMs, &r.InputTokens, &r.OutputTokens, &r.CacheRead, &r.CacheWrite, &r.Reasoning, &r.Cost, &errs); err != nil {
 			return nil, err
 		}
 		r.TS = time.UnixMilli(ts)
@@ -250,6 +335,7 @@ type Bucket struct {
 	CacheRead    int64   `json:"cache_read_tokens"`
 	AvgTTFBms    float64 `json:"avg_ttfb_ms"`
 	P95TTFBms    int64   `json:"p95_ttfb_ms"`
+	Cost         float64 `json:"cost_usd"`
 }
 
 type Stats struct {
@@ -264,7 +350,7 @@ type Stats struct {
 func (s *Store) Stats(ctx context.Context, since time.Time) (*Stats, error) {
 	st := &Stats{Since: since}
 	ms := since.UnixMilli()
-	agg := `COUNT(*), SUM(status>=400), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read),0), COALESCE(AVG(CASE WHEN status<400 THEN ttfb_ms END),0)`
+	agg := `COUNT(*), SUM(status>=400), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read),0), COALESCE(AVG(CASE WHEN status<400 THEN ttfb_ms END),0), COALESCE(SUM(cost),0)`
 	scan := func(q string, args ...any) ([]Bucket, error) {
 		rows, err := s.db.QueryContext(ctx, q, args...)
 		if err != nil {
@@ -275,7 +361,7 @@ func (s *Store) Stats(ctx context.Context, since time.Time) (*Stats, error) {
 		for rows.Next() {
 			var b Bucket
 			var errs sql.NullInt64
-			if err := rows.Scan(&b.Key, &b.Requests, &errs, &b.InputTokens, &b.OutputTokens, &b.CacheRead, &b.AvgTTFBms); err != nil {
+			if err := rows.Scan(&b.Key, &b.Requests, &errs, &b.InputTokens, &b.OutputTokens, &b.CacheRead, &b.AvgTTFBms, &b.Cost); err != nil {
 				return nil, err
 			}
 			b.Errors = errs.Int64

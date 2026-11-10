@@ -158,8 +158,8 @@ func eventType(name, data []byte) string {
 	return t.Type
 }
 
-// UsageFromEvent extracts usage from message_start / message_delta events,
-// for passthrough streams that are not otherwise decoded.
+// UsageFromEvent extracts usage from message_start / message_delta events
+// (passthrough streams) or from a whole non-streaming message.
 func UsageFromEvent(name, data []byte) (*ir.Usage, bool) {
 	if len(name) > 0 && string(name) != "message_start" && string(name) != "message_delta" {
 		return nil, false
@@ -182,7 +182,7 @@ func UsageFromEvent(name, data []byte) (*ir.Usage, bool) {
 		if ev.Message != nil && ev.Message.Usage != nil {
 			return ev.Message.Usage.toIR(), true
 		}
-	case "message_delta":
+	case "message_delta", "message": // "message" is a whole non-streaming response
 		if ev.Usage != nil {
 			return ev.Usage.toIR(), true
 		}

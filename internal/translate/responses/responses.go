@@ -133,6 +133,13 @@ type upResponse struct {
 func UsageFromEvent(name, data []byte) (*ir.Usage, bool) {
 	switch eventType(name, data) {
 	case "response.completed", "response.incomplete":
+	case "":
+		// A whole non-streaming response object carries usage at the top level.
+		var r upResponse
+		if len(name) == 0 && json.Unmarshal(data, &r) == nil && r.Usage != nil {
+			return r.Usage.ir(), true
+		}
+		return nil, false
 	default:
 		return nil, false
 	}

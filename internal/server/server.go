@@ -20,6 +20,7 @@ import (
 	"github.com/Project-by-Myself/clirouter/internal/router"
 	"github.com/Project-by-Myself/clirouter/internal/store"
 	"github.com/Project-by-Myself/clirouter/internal/upstream"
+	"github.com/Project-by-Myself/clirouter/internal/usage"
 )
 
 const Version = "0.1.0"
@@ -50,8 +51,10 @@ type Server struct {
 func New(path string, cfg *config.Config, st *store.Store, log *slog.Logger, static http.Handler, oauth func(string, string) router.TokenSource) *Server {
 	s := &Server{path: path, store: st, started: time.Now(), log: log, static: static, oauth: oauth,
 		adminFails: newFailLimiter(10, 5*time.Minute), clientFails: newFailLimiter(30, time.Minute)}
-	rt := &proxy.Runtime{Cfg: cfg, Router: router.New(cfg, nil, oauth), Clients: upstream.NewClients(cfg.Timeouts.Connect.D())}
+	rt := proxy.NewRuntime(cfg, router.New(cfg, nil, oauth), upstream.NewClients(cfg.Timeouts.Connect.D()))
 	s.h = proxy.NewHandler(rt, st)
+	s.h.Usage = usage.New(s.loadUsage)
+	s.h.Usage.Sync(cfg)
 	if fi, err := os.Stat(path); err == nil {
 		s.modTime = fi.ModTime()
 	}
@@ -69,6 +72,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1beta/models/{action}", s.gemini)
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("GET /v1beta/models", s.models)
+	mux.HandleFunc("GET /v1/key/info", s.keyInfo)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := s.clientAuth(w, r, ir.FormatChat); !ok {
@@ -160,7 +164,8 @@ func (s *Server) gemini(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.clientAuth(w, r, ir.FormatChat); !ok {
+	name, ok := s.clientAuth(w, r, ir.FormatChat)
+	if !ok {
 		return
 	}
 	type model struct {
@@ -174,7 +179,11 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	}
 	names := s.modelNames()
 	out := make([]model, 0, len(names))
+	key := s.h.Runtime().Keys[name]
 	for _, n := range names {
+		if key != nil && !key.AllowsModel(n.id) {
+			continue
+		}
 		out = append(out, model{ID: n.id, Object: "model", Created: s.started.Unix(), OwnedBy: n.owner, Type: "model", DisplayName: n.id})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -256,7 +265,8 @@ func (s *Server) swap(cfg *config.Config) {
 	if cfg.Timeouts.Connect != old.Cfg.Timeouts.Connect {
 		clients = upstream.NewClients(cfg.Timeouts.Connect.D())
 	}
-	s.h.SetRuntime(&proxy.Runtime{Cfg: cfg, Router: router.New(cfg, old.Router, s.oauth), Clients: clients})
+	s.h.SetRuntime(proxy.NewRuntime(cfg, router.New(cfg, old.Router, s.oauth), clients))
+	s.h.Usage.Sync(cfg)
 }
 
 // Watch polls the config file and reloads on change (no fsnotify dependency;

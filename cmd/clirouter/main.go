@@ -18,6 +18,7 @@ import (
 
 	"github.com/Project-by-Myself/clirouter/internal/auth"
 	"github.com/Project-by-Myself/clirouter/internal/config"
+	"github.com/Project-by-Myself/clirouter/internal/pricing"
 	"github.com/Project-by-Myself/clirouter/internal/server"
 	"github.com/Project-by-Myself/clirouter/internal/store"
 	"github.com/Project-by-Myself/clirouter/web"
@@ -112,6 +113,13 @@ func main() {
 	st, err := store.Open(cfg.DataDir, cfg.Logging.RetentionDays)
 	if err != nil {
 		fatal(log, fmt.Errorf("open store: %w", err))
+	}
+	// One-time: price existing request history and build the usage rollup.
+	ptab := pricing.New(cfg.Pricing)
+	if err := st.Backfill(context.Background(), func(provider, up, model string, in, out, cr, cw int64) float64 {
+		return ptab.Cost(provider, up, model, pricing.Usage{Input: in, Output: out, CacheRead: cr, CacheWrite: cw})
+	}); err != nil {
+		log.Warn("usage backfill failed", "err", err)
 	}
 	am := auth.NewManager(cfg.DataDir, nil)
 	am.Logger = log
